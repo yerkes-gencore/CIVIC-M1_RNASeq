@@ -1,0 +1,421 @@
+---
+title: "model_validation"
+author: "ENPRC Gencore"
+date:  "`r Sys.Date()`"
+output: 
+  rmdformats::robobook:
+    fig_width: 9
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE,
+                      message = FALSE, 
+                      echo=FALSE,
+                      fig.width = 6,
+                      fig.height = 4,
+                      dev='png')
+library(tidyverse)    ## General logic and processing
+library(DESeq2)       ## Makes us have a job
+library(here)         ## For consistent directory structures
+library(edgeR)
+library(DT)
+library(reshape2)
+library(gencoreBulk)
+```
+
+# Read metadata
+
+
+```{r}
+plots <- list()
+obj <- readRDS(here('saved_rds_objects/analysis_post_QC.Rds'))
+```
+
+## Set levels
+
+```{r}
+obj$dds$timepoint <- factor(obj$dds$timepoint, levels = c('D0', 'D1', 'D2', 'D4', 'D7'))
+obj$dds$Group <- factor(obj$dds$Group, levels = c('No_adjuvant', 'AS03'))
+obj$dds$ind <- factor(plyr::mapvalues(obj$dds$individual,
+                                         from = c('RAi18', 'RHj18', 'RRh18', 'LT86', 'RJm18',
+                                                  'RRv18', 'RTy18', 'LP78', 'RLv18', 'RTi18'),
+                                         to = c(1:5, 1:5)))
+```
+
+```{r}
+metadata <- as.data.frame(colData(obj$dds))
+exp_data <- obj$dds
+plots <- list()
+```
+
+```{r}
+metadata %>%
+  select(-c(FileID, ellipse, SampleID, sizeFactor, replaceable))
+  # select(sampleID, SubjectID, grp)
+```
+
+```{r}
+relevant_cols <- colnames(metadata %>% select(-c(FileID, ellipse, SampleID, sizeFactor, replaceable)))
+metadata_summary <- lapply(relevant_cols, function(x) table(unlist((metadata[[x]]))))
+names(metadata_summary) <- relevant_cols
+metadata_summary
+```
+
+```{r}
+table(metadata$individual, metadata$timepoint)
+```
+
+```{r}
+table(metadata$Group, metadata$timepoint)
+```
+
+```{r}
+table(metadata$individual, metadata$ind, metadata$Group)
+```
+
+# Design
+
+```{r}
+design_formula <- as.formula('~ 0 + timepoint + Group + Group:timepoint + Group:ind')
+design_matrix  <- stats::model.matrix(design_formula, data = metadata)
+colnames(design_matrix)
+```
+
+```{r}
+design_matrix
+```
+
+## Fit design
+
+```{r}
+design(obj$dds) <- design_formula
+obj$dds <- DESeq2::DESeq(obj$dds)
+# obj$dds <- edgeR::voomLmFit(counts = obj$dds,
+#                               design = design_matrix,
+#                               block = metadata$individual,
+#                               sample.weights = TRUE)
+```
+
+# Define contrasts
+
+Explicitly write out full contrast formulas, including terms that will cancel.
+This avoids mistakes and facilitates plotting.
+
+Remember to use valid names, which may differ from the original names
+
+```{r}
+make.names(colnames(design_matrix))
+```
+
+
+```{r}
+contrast_matrix_expanded <- data.frame(
+  contrast_names = c(
+    'No_adjuvant_D1',
+    'No_adjuvant_D2',
+    'No_adjuvant_D4',
+    'No_adjuvant_D7',
+    'AS03_D1',
+    'AS03_D2',
+    'AS03_D4',
+    'AS03_D7',
+    'D1_AS03.v.No_adjuvant',
+    'D2_AS03.v.No_adjuvant',
+    'D4_AS03.v.No_adjuvant',
+    'D7_AS03.v.No_adjuvant'
+  ),
+  numerators = c(
+    'timepointD1',
+    'timepointD2',
+    'timepointD4',
+    'timepointD7',
+    'GroupAS03 + timepointD1 + timepointD1.GroupAS03',
+    'GroupAS03 + timepointD2 + timepointD2.GroupAS03',
+    'GroupAS03 + timepointD4 + timepointD4.GroupAS03',
+    'GroupAS03 + timepointD7 + timepointD7.GroupAS03',
+    '( GroupAS03 + timepointD1 + timepointD1.GroupAS03 ) - ( GroupAS03 + timepointD0 )',
+    '( GroupAS03 + timepointD2 + timepointD2.GroupAS03 ) - ( GroupAS03 + timepointD0 )',
+    '( GroupAS03 + timepointD4 + timepointD4.GroupAS03 ) - ( GroupAS03 + timepointD0 )',
+    '( GroupAS03 + timepointD7 + timepointD7.GroupAS03 ) - ( GroupAS03 + timepointD0 )'
+  ),
+  denominators = c(
+    'timepointD0',
+    'timepointD0',
+    'timepointD0',
+    'timepointD0',
+    'GroupAS03 + timepointD0',
+    'GroupAS03 + timepointD0',
+    'GroupAS03 + timepointD0',
+    'GroupAS03 + timepointD0',
+    'timepointD1 - timepointD0',
+    'timepointD2 - timepointD0',
+    'timepointD4 - timepointD0',
+    'timepointD7 - timepointD0'
+  )
+)
+```
+
+```{r}
+contrast_matrix <- apply(contrast_matrix_expanded, MARGIN = 1, function(row) {
+  paste0('(', row[2], ') - (', row[3], ')')
+})
+contrast_matrix <- limma::makeContrasts(contrasts = contrast_matrix,
+    levels = make.names(colnames(design_matrix)))
+colnames(contrast_matrix) <- contrast_matrix_expanded$contrast_names
+contrast_matrix
+```
+
+## Extract contrasts
+
+```{r}
+DESeq_results <- apply(contrast_matrix, 2, gencoreBulk::extractFilteredDESeqResults, dds = obj$dds)
+# DESeq_results <- apply(contrast_matrix, 2, extractFilteredDESeqResultsGKT, dds = obj$dds)
+
+## Remame results for easier recall later
+names(DESeq_results) <- colnames(contrast_matrix)
+```
+
+# Check results
+
+```{r}
+DESeq_results$AS03_D7 %>% 
+  as.data.frame() %>%
+  slice_min(padj, n=10)
+```
+
+```{r}
+tmp <- data.table::rbindlist(lapply(DESeq_results, function(x) {
+  up <- x %>% as.data.frame() %>% filter(log2FoldChange > 0) %>% filter(padj<0.05) %>% nrow()
+  down <- x %>% as.data.frame() %>% filter(log2FoldChange < 0) %>% filter(padj<0.05) %>% nrow()
+  return(list(up=up, down=down))
+}))
+
+tmp <- cbind(timepoint = c('D1', 'D2', 'D4', 'D7'), tmp[1:4,], tmp[5:8,], tmp[9:12,])
+plots[['overall_table']] <- tmp %>%
+  knitr::kable(digits = 3) %>%
+  kableExtra::add_header_above(c('', 'No_adjuvant' = 2, 'AS03' = 2, 'Interaction' = 2))
+plots[['overall_table']]
+```
+
+# Case study ISG15
+
+```{r}
+plotGeneExpression <- function(gene,
+                               grouping,
+                               groups,
+                               counts,
+                               metadata,
+                               subsetting,
+                               subsets,
+                               boxplot = TRUE,
+                               jitter = TRUE,
+                               axis_text_x = element_text(angle = 90, vjust = 0.5, hjust=1)) {
+  # if (missing(gene) | missing(grouping) | missing(counts) | missing(metadata)) {
+  #   stop('The following arguments are all required: gene, grouping, groups, counts, metadata')
+  # }
+  if (!(gene %in% rownames(counts))){
+    stop('Gene not found in counts data')
+  }
+  if (!grouping %in% colnames(metadata)) {
+    stop('grouping variable not found in metadata')
+  }
+  if (xor(missing(subsetting), missing(subsets))) {
+    stop('Subsetting data requires both subsets and subsetting to be specified')
+  } 
+  if (any(colnames(counts) != rownames(metadata))) {
+    warning('Colnames of counts does not match rownames of metadata. Continuing, but
+            this may suggest the data are not properly associated')
+  }
+  if (!missing(subsetting)) {
+    if (!subsetting %in% colnames(metadata)) {
+      stop('subsetting variable not found in metadata')
+    }
+    metadata <- metadata[metadata[[subsetting]] %in% subsets,]
+    counts <- counts[,rownames(metadata)]
+  }
+  plotdata <- utils::stack(counts[gene, ])
+  colnames(plotdata) <- 'Gene'
+  plotdata$grouping <- metadata[[grouping]]
+  print(groups)
+  print(unique(metadata[[grouping]]))
+  if (!missing(groups)) {
+    if (!all(groups %in% unique(metadata[[grouping]]))) {
+      stop('All groups not found in grouping variable of metadata')
+    }
+    plotdata$grouping <- factor(plotdata$grouping, levels = groups)
+    plotdata <- plotdata[!is.na(plotdata$grouping),]
+  }
+  ggplot2::ggplot(plotdata, aes(x=grouping, y=.data[['Gene']])) + 
+    (if (boxplot) { ggplot2::geom_boxplot(outlier.color = if (jitter) {NA} else {'black'}) }) +
+    (if (jitter) { ggplot2::geom_jitter() }) +
+    ggplot2::theme_bw() +
+    ggplot2::labs(x = 'Group', y = 'Expression', title = gene, 
+                  caption = (if (!missing(subsetting)) {
+                    paste0('Subsetting data on variable ', subsetting, 
+                           ' for value(s) ', paste0(subsets, collapse = ', '))
+                    } else {NULL})) +
+    ggplot2::theme(axis.text.x = axis_text_x) 
+}
+```
+
+
+```{r}
+gene_to_plot <- 'ISG15'
+
+metadata$ellipse <- interaction(metadata$Group,metadata$timepoint,sep="_") # may need this ??
+obj$dds$ellipse <- interaction(obj$dds$Group,obj$dds$timepoint,sep="_") # this works for plot below
+terms_of_interest <- c('No_adjuvant_D1', 'AS03_D1', 'D1_AS03.v.No_adjuvant')
+
+base_expression <- assay(obj$dds@assays@data$rld[gene_to_plot,]) %>% stack()
+base_expression <- merge(base_expression, metadata,
+                         by.x = 'col', by.y = 'row.names')
+
+coefs <- coef(obj$dds)[gene_to_plot,]
+names(coefs) <- make.names(names(coefs))
+contrast_mat <- contrast_matrix
+
+coef_lines <- contrast_matrix_expanded
+coef_lines$numerators <- unlist(lapply(coef_lines$numerators, function(x) {
+  x <- x %>% 
+    strsplit(split = '\\s+') %>%
+    unlist()
+  x[x %in% rownames(contrast_mat)] <- unname(coefs[x[x %in% rownames(contrast_mat)]])
+  x <- eval(parse(text=paste(x, collapse = ' ')))
+}))
+
+coef_lines$denominators <- unlist(lapply(coef_lines$denominators, function(x) {
+  x <- x %>% 
+    strsplit(split = '\\s+') %>%
+    unlist()
+  x[x %in% rownames(contrast_mat)] <- coefs[x[x %in% rownames(contrast_mat)]]
+  x <- eval(parse(text=paste(x, collapse = ' ')))
+}))
+
+coef_lines_plot <- as.data.frame(data.table::rbindlist(lapply(seq_along(terms_of_interest[1:2]), function(x){
+  term <- terms_of_interest[x]
+  y = coef_lines[coef_lines$contrast_names==term,'denominators']
+  yend = y +
+    filter(rownames_to_column(as.data.frame(DESeq_results[[term]]), 'gene'),
+           gene == gene_to_plot)$log2FoldChange
+  padj = filter(rownames_to_column(as.data.frame(DESeq_results[[term]]), 'gene'),
+                     gene == gene_to_plot)$padj
+  x = ifelse(x==1, 1.5, 3.5)
+  xend = x
+  return(data.frame(term=term, x=x, xend=xend, y=y, yend=yend, padj=padj))
+})))
+coef_lines_plot[3,] <- unname(unlist(c(terms_of_interest[[3]], 2.5, 2.5, coef_lines_plot[1,5], 
+                         coef_lines_plot[1,5] + filter(rownames_to_column(as.data.frame(DESeq_results[[terms_of_interest[3]]]), 'gene'),
+           gene == gene_to_plot)$log2FoldChange,
+           filter(rownames_to_column(as.data.frame(DESeq_results[[terms_of_interest[3]]]), 'gene'),
+           gene == gene_to_plot)$padj
+           )))
+coef_lines_plot <- coef_lines_plot %>%
+  mutate(x = as.numeric(x),
+         xend = as.numeric(xend),
+         y=as.numeric(y),
+         yend=as.numeric(yend),
+         padj=as.numeric(padj))
+plots[['ISG15_D1']] <- plotGeneExpression(gene_to_plot, grouping = 'ellipse',
+                                              groups = c('No_adjuvant_D0', 'No_adjuvant_D1',
+                                                         'AS03_D0', 'AS03_D1'),
+                   counts = assay(assays(obj$dds)$vst), metadata = colData(obj$dds)) +
+  geom_segment(data = coef_lines_plot, aes(x=x, xend=xend, y=y, yend=yend, color=term, alpha=padj), arrow=arrow(length = unit(0.075, 'inches'))) + 
+  scale_alpha(range = c(1,0.25))
+plots[['ISG15_D1']]
+```
+
+```{r}
+gene_to_plot <- 'ISG15'
+
+terms_of_interest <- c('No_adjuvant_D7', 'AS03_D7', 'D7_AS03.v.No_adjuvant')
+
+base_expression <- assay(obj$dds@assays@data$rld[gene_to_plot,]) %>% stack()
+base_expression <- merge(base_expression, metadata,
+                         by.x = 'col', by.y = 'row.names')
+
+coefs <- coef(obj$dds)[gene_to_plot,]
+names(coefs) <- make.names(names(coefs))
+contrast_mat <- contrast_matrix
+
+coef_lines_plot <- as.data.frame(data.table::rbindlist(lapply(seq_along(terms_of_interest[1:2]), function(x){
+  term <- terms_of_interest[x]
+  y = coef_lines[coef_lines$contrast_names==term,'denominators']
+  yend = y +
+    filter(rownames_to_column(as.data.frame(DESeq_results[[term]]), 'gene'),
+           gene == gene_to_plot)$log2FoldChange
+  padj = filter(rownames_to_column(as.data.frame(DESeq_results[[term]]), 'gene'),
+                     gene == gene_to_plot)$padj
+  x = ifelse(x==1, 1.5, 3.5)
+  xend = x
+  return(data.frame(term=term, x=x, xend=xend, y=y, yend=yend, padj=padj))
+})))
+coef_lines_plot[3,] <- unname(unlist(c(terms_of_interest[[3]], 2.5, 2.5, coef_lines_plot[1,5], 
+                         coef_lines_plot[1,5] + filter(rownames_to_column(as.data.frame(DESeq_results[[terms_of_interest[3]]]), 'gene'),
+           gene == gene_to_plot)$log2FoldChange,
+           filter(rownames_to_column(as.data.frame(DESeq_results[[terms_of_interest[3]]]), 'gene'),
+           gene == gene_to_plot)$padj
+           )))
+coef_lines_plot <- coef_lines_plot %>%
+  mutate(x = as.numeric(x),
+         xend = as.numeric(xend),
+         y=as.numeric(y),
+         yend=as.numeric(yend),
+         padj=as.numeric(padj))
+plots[['ISG15_D7']] <- plotGeneExpression(gene_to_plot, grouping = 'ellipse',
+                                              groups = c('No_adjuvant_D1', 'No_adjuvant_D7',
+                                                         'AS03_D1', 'AS03_D7'),
+                   counts = assay(assays(obj$dds)$vst), metadata = colData(obj$dds)) +
+  geom_segment(data = coef_lines_plot, aes(x=x, xend=xend, y=y, yend=yend, color=term, alpha=padj), arrow=arrow(length = unit(0.075, 'inches'))) + 
+  scale_alpha(range = c(1,0.25))
+plots[['ISG15_D7']]
+```
+
+```{r}
+gene_to_plot = 'ISG15'
+
+plotdata <- utils::stack(assay(assays(obj$dds)$vst)[gene_to_plot, ])
+plotdata <- merge(plotdata, as.data.frame(colData(obj$dds)), by.x='ind', by.y='row.names')
+plots[['ISG15_overall']] <- ggplot2::ggplot(plotdata, aes(x=timepoint, y=values, color = Group, label=ind.y)) + 
+        ggplot2::geom_boxplot() +
+  # geom_jitter(position='dodge') +
+  # geom_text() +
+        ggplot2::theme_bw() +
+        ggplot2::labs(x = 'Group', y = 'Expression', title = gene_to_plot) #+
+        # ggplot2::theme(axis.text.x = element_text(angle=45, vjust=1)) 
+value <- coefs['timepointD4'] + coefs['timepointD4.GroupAS03'] #+ coefs['GroupAS03']
+plots[['ISG15_overall']]
+```
+
+```{r}
+tmp <- data.table::rbindlist(lapply(names(DESeq_results), function(x){
+  DESeq_results[[x]] %>% 
+    as.data.frame() %>% 
+    rownames_to_column('gene') %>% 
+    filter(gene == 'ISG15') %>%
+    mutate(contrast = x)
+})) %>% 
+  select(contrast, log2FoldChange, padj)
+tmp <- cbind(timepoint = c('D1', 'D2', 'D4', 'D7'), tmp[1:4,2:3], tmp[5:8,2:3], tmp[9:12,2:3])
+plots[['ISG15_overall_table']] <- tmp %>%
+  knitr::kable(digits = 3) %>%
+  kableExtra::add_header_above(c('', 'No_adjuvant' = 2, 'AS03' = 2, 'Interaction' = 2))
+```
+
+# Save objs
+
+```{r}
+saveRDS(obj, here('saved_rds_objects/analysis_post_model-fit.Rds'))
+saveRDS(DESeq_results, here('saved_rds_objects/extracted-results.Rds'))
+```
+
+# Render report
+
+```{r}
+rmarkdown::render(here::here('analysis_scripts/model_validation.format.Rmd'),
+                  output_file = 'model-design.html',
+                  output_dir = here::here('reports'),
+                  params = list(
+                    title = 'Model check')
+                  )
+```

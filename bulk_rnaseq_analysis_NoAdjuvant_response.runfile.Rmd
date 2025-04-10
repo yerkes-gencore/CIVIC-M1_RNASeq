@@ -1,0 +1,2448 @@
+---
+title: "bulk_RNAseq_Analysis"
+author: "DTG"
+date:  "`r Sys.Date()`"
+output: 
+  rmdformats::robobook:
+    fig_width: 9
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = TRUE,
+                      message = TRUE, 
+                      echo=FALSE, 
+                      fig.width = 8, 
+                      fig.height = 4)
+
+# library(ggforce)
+# library(grid)
+# library(ggpubr)
+# library(EDASeq)
+#library(shiny)
+library(EnhancedVolcano)
+# library(tools)
+library(ComplexHeatmap)
+# library(gridExtra)
+# library(gtable)
+library(reshape2)
+#library(rlang)
+# library(forcats)
+library(gtools)
+library(RColorBrewer)
+library(fgsea)
+# library(MatrixGenerics)
+library(tidyverse)    ## General logic and processing
+library(yaml)         ## Parse config
+library(DESeq2)       ## Makes us have a job
+library(DT)           ## Interactive tables
+#library(circlize)     ## For colorRamp2 in heatmaps
+library(openxlsx)     ## Writing count table outputs
+#library(reshape2)
+library(kableExtra)   ## Formatting tables
+library(here)         ## For consistent directory structures
+##library(plotly)     ## If you want interactive PCA
+#library(ggrepel)      ## for PCA plot repel text
+#library(plyr)
+library(dplyr) ## loading after to overwrite groupby and summarize from plyr
+library(msigdbr)      ## Loads pathway genesets from MsigDB
+
+library(pals)
+library(ggalluvial)
+
+#remotes::install_github('yerkes-gencore/gencoreBulk')
+library(gencoreBulk)  ## See the git repo for instructions on using this
+
+## getting my extensions, need to add to gencoreBulk
+source("/yerkes-cifs/runs/home/gktharp/gitrepos/Coding_Club/BulkRNASeq/gktharp/GKTDESeq2Extentions.R")
+
+## sometimes they conflict with other loaded packages
+counts <- DESeq2::counts
+here <- here::here
+```
+
+
+```{r}
+analysis <- readRDS(here('saved_rds_objects/analysis_post_model-fit.Rds'))
+analysis$analysis_config <- yaml.load_file(here("config/analysis_config.yml"))
+model_results <- readRDS(here('saved_rds_objects/extracted-results.Rds'))
+#analysis$sampleTable <- data.frame(lapply(analysis$sampleTable, as.factor))
+plotting_obj <- assays(analysis$dds)$rld
+plotting_obj <- plotting_obj[,(colData(plotting_obj) %>% 
+                               as.data.frame() %>% 
+                               arrange(timepoint, Group, individual))$FileID]
+```
+
+
+# Examination of No Adjuvant response
+
+```{r}
+
+## Start with D7 which has the most DEGs and compare to the AS03 response
+
+## first get the sig DE's
+
+No_adjuvant_D7_sig <- as.annot.data.frame(model_results$No_adjuvant_D7,
+                                          subset = "All",
+                                          relabel = "-1,0,0,0,+1,0,0,0,0,0,0,0,0,0,0,0,0,0",
+                                          newlabel = "D7/D0 (No_adjuvant)") %>%
+  filter(`padj (BH adjusted p-values: D7/D0 (No_adjuvant))` < 0.05)
+
+No_adjuvant_D7_sig_wAS03 <- left_join(No_adjuvant_D7_sig,
+                                      as.annot.data.frame(model_results$AS03_D7,
+                                                          subset = "All",
+                                                          relabel = "-1,0,0,0,+1,0,0,0,0,+1,0,0,0,0,0,0,0,0",
+                                                          newlabel = "D7/D0 (AS03)"))
+                                            
+                                            
+
+```
+
+```{r}
+
+filter(No_adjuvant_D7_sig_wAS03,
+       `padj (BH adjusted p-values: D7/D0 (No_adjuvant))` < 0.01) %>%
+  ggplot(
+       aes(x=`log2FoldChange (log2 fold change (MLE): D7/D0 (No_adjuvant))`,
+           y=`log2FoldChange (log2 fold change (MLE): D7/D0 (AS03))`,
+           color = `pvalue (Wald test p-value: D7/D0 (No_adjuvant))`
+           )) +
+  geom_abline(slope = 1,intercept = 0,alpha = 0.3) +
+  geom_abline(slope = 0.45,intercept = 0, alpha = 0.3, color = "red") +
+  geom_point(size = 0.01) +
+  geom_smooth(method = "lm")
+```
+
+```{r}
+as.data.frame(model_results$AS03_D2) %>%
+  rownames_to_column(var = "gene_id") %>%
+  filter(padj < 0.05) %>%
+  rename_with(~ str_c("AS03_D2_",.x), -c("gene_id","baseMean")) %>%
+  full_join(as.data.frame(model_results$AS03_D4) %>%
+              rownames_to_column(var = "gene_id") %>%
+              filter(padj < 0.05) %>%
+              rename_with(~ str_c("AS03_D4_",.x), -c("gene_id","baseMean"))) %>%
+  str()
+
+as.data.frame(model_results$No_adjuvant_D4) %>%
+  rownames_to_column(var = "gene_id") %>%
+  filter(padj < 0.05) %>%
+  rename_with(~ str_c("No_adjuvant_D4_",.x), -c("gene_id","baseMean")) %>%
+  full_join(as.data.frame(model_results$No_adjuvant_D7) %>%
+              rownames_to_column(var = "gene_id") %>%
+              filter(padj < 0.05) %>%
+              rename_with(~ str_c("No_adjuvant_D7_",.x), -c("gene_id","baseMean"))) %>%
+  str()
+```
+
+# Try dds of No Adjuvant alone
+
+```{r}
+
+analysis$dds_No_adjuvant = DESeqDataSetFromMatrix(countData = counts(analysis$dds)[,analysis$dds$Group == "No_adjuvant"],
+                                                  colData = droplevels(colData(analysis$dds)[analysis$dds$Group == "No_adjuvant",-c(7:8)]),
+                                                  design = ~ ind + timepoint)
+
+analysis$dds_No_adjuvant <- DESeq(analysis$dds_No_adjuvant,parallel = TRUE)
+
+```
+
+
+# Try dds of AS03 alone
+
+```{r}
+
+analysis$dds_AS03 = DESeqDataSetFromMatrix(countData = counts(analysis$dds)[,analysis$dds$Group == "AS03"],
+                                                  colData = droplevels(colData(analysis$dds)[analysis$dds$Group == "AS03",-c(7:8)]),
+                                                  design = ~ ind + timepoint)
+
+analysis$dds_AS03 <- DESeq(analysis$dds_AS03,parallel = TRUE)
+
+```
+
+# DESeq2 design
+
+```{r}
+
+analysis$dds_byDesign = DESeqDataSetFromMatrix(countData = counts(analysis$dds),
+                                               colData = colData(analysis$dds)[,-c(7:8)],
+                                               design = ~ ind + Group * timepoint)
+
+analysis$dds_byDesign = DESeq(analysis$dds_byDesign, parallel = TRUE)
+
+```
+
+```{r}
+res_D0 <- results(analysis$dds_byDesign,
+                  contrast = list(c("Group_AS03_vs_No_adjuvant")),
+                  filter = maxMinFilter(analysis$dds_byDesign,
+                                        intgroup = "Group",
+                                        comp = c("AS03","No_adjuvant")),
+                  alpha = 0.05)# %>%
+  # as.data.frame() %>%
+  # rownames_to_column(var = "gene_id")
+
+summary(res_D0)
+
+as.data.frame(res_D0) %>%
+  rownames_to_column(var = "gene_id") %>%
+  filter(!is.na(padj),
+         padj < 0.05)
+```
+
+
+# DESeq2 timepoint allsamples
+
+```{r}
+
+analysis$dds_timepoint = DESeqDataSetFromMatrix(countData = counts(analysis$dds),
+                                               colData = colData(analysis$dds)[,-c(7:8)],
+                                               design = ~ ind + timepoint)
+
+analysis$dds_timepoint = DESeq(analysis$dds_timepoint, parallel = TRUE)
+
+```
+
+```{r}
+
+res_timepoint <- sapply(levels(analysis$dds_timepoint$timepoint)[-1],
+                  function(x) {
+                    results(analysis$dds_timepoint,
+                            contrast = list(c(str_c("timepoint_",x,"_vs_D0"))),
+                            filter = maxMinFilter(analysis$dds_timepoint,
+                                                  intgroup = "timepoint",
+                                                  comp = c(x,"D0")),
+                            alpha = 0.05) %>%
+                      as.data.frame() %>%
+                      rownames_to_column(var = "gene_id")
+                  },
+                  simplify = FALSE) %>%
+                    bind_rows(.id = "contrast") %>%
+  mutate(
+    method = "timepoint",
+    Group = "All"
+  )
+
+```
+
+
+```{r fig.height=8}
+res_timepoint %>%
+  mutate(direction = if_else(log2FoldChange > 0,"up","down")) %>%
+  group_by(contrast,direction) %>%
+  filter(!is.na(padj),
+         padj < 0.05) %>%
+  summarise(sigCount = n())
+
+res_timepoint_summary <- res_timepoint %>%
+  group_by(gene_id) %>%
+  summarise(everTested = any(!is.na(padj)),
+            everSig = any(padj < 0.05))
+
+res_timepoint %>%
+  group_by(gene_id) %>%
+  mutate(everTested = any(!is.na(padj)),
+            everSig = any(padj < 0.05)) %>%
+  ungroup() %>%
+  filter(everSig == TRUE) %>%
+  mutate(sig = factor(case_when(
+    padj < 0.05 & log2FoldChange > 0 ~ "sigUp",
+    padj < 0.05 & log2FoldChange < 0 ~ "sigDn",
+    .default = "notSig"
+  ),levels = c("sigUp","notSig","sigDn"))) %>%
+  select(c(gene_id,contrast,sig)) %>%
+  pivot_wider(names_from = contrast, values_from = sig) %>%
+  group_by(D1,D2,D4,D7) %>% summarise(n=n()) %>% kbl() %>% kable_classic()
+  
+  
+  # pivot_longer(cols = c(contrast,sig),values_to = "contrast_sig") %>% str()
+  # add_count(sig,name = "freq") %>%
+  # add_count(contrast,sig) %>%
+  # pull(n) %>% unique()
+
+res_timepoint %>%
+  group_by(gene_id) %>%
+  mutate(everTested = any(!is.na(padj)),
+            everSig = any(padj < 0.05)) %>%
+  ungroup() %>%
+  filter(everSig == TRUE) %>%
+  mutate(sig = factor(case_when(
+    padj < 0.05 & log2FoldChange > 0 ~ "sigUp",
+    padj < 0.05 & log2FoldChange < 0 ~ "sigDn",
+    .default = "notSig"
+  ),levels = c("sigUp","notSig","sigDn"))) %>%
+  add_count(sig,name = "freq") %>%
+  add_count(contrast,sig) %>%
+  ggplot(aes(x = contrast,
+             # y = n,
+             alluvium = gene_id,
+             stratum = sig,
+             fill = sig,
+             label = n)) +
+  geom_flow(stat = "alluvium") +
+  # geom_flow(stat = "alluvium") +
+  geom_stratum() +
+  # geom_text(stat = "flow", nudge_x = 0.3) +
+  geom_text(stat = "stratum")
+
+res_timepoint %>%
+  mutate(sig = padj < 0.05) %>%
+  ggplot(aes(x = contrast,
+             alluvium = gene_id,
+             stratum = sig, fill = sig)) +
+  geom_flow(stat = "alluvium")
+
+```
+
+# combine matrix and timepoint
+
+```{r}
+res_mat_time <- bind_rows(matrix = res_matrix,
+                          timepoint = res_timepoint,
+                          .id = "method")
+
+res_mat_time$Group = factor(res_mat_time$Group, levels = c("No_adjuvant","AS03","All"))
+res_mat_time$contrast = factor(res_mat_time$contrast, levels = c("D1","D2","D4","D7"))
+
+res_mat_time_full <- bind_rows(matrix = res_matrix_full,
+                               timepoint = res_timepoint,
+                               .id = "method") %>%
+  mutate(Group = factor(Group, levels = c("No_adjuvant","AS03","Interaction","All")),
+         contrast = factor(contrast, levels = c("D1","D2","D4","D7")))
+
+```
+## D4
+```{r}
+D4_No_adjuvant_volcomp <- compVolcanoFor(res_mat_time,
+               facetGroup = "Group",
+               sigGroup = "No_adjuvant",
+               contrast %in% c("D4")) + ggtitle("D4")
+
+D4_All_volcomp <- compVolcanoFor(res_mat_time,
+               facetGroup = "Group",
+               sigGroup = "All",
+               contrast %in% c("D4")) + ggtitle("D4")
+
+D4_AS03_volcomp <- compVolcanoFor(res_mat_time,
+               facetGroup = "Group",
+               sigGroup = "AS03",
+               contrast %in% c("D4")) + ggtitle("D4")
+
+D4_No_adjuvant_volcomp
+D4_All_volcomp
+D4_AS03_volcomp
+
+  # ggplotdat <- filter(res_mat_time,
+  #              Group %in% c("AS03"),
+  #              contrast %in% c("D4")) %>%
+  #   filter(!is.na(padj)) %>%
+  #   mutate(sigInGroup = (gene_id %in% sigGenesFor(res_mat_time,res_mat_time[["method"]] %in% c("matrix"),
+  #              Group %in% c("AS03"),
+  #              contrast %in% c("D4")))) %>%
+  #   # mutate(sigInGroup = (gene_id %in% sigGenesFor(res_combined,Group %in% c(sigGroup),...))) %>%
+  #   arrange(sigInGroup)
+  # ggplot(ggplotdat, aes(x=log2FoldChange,
+  #              y=-log10(pvalue),
+  #              color = sigInGroup)) +
+  #   geom_point(size = 0.33) +
+  #   scale_color_manual(values = c("TRUE" = "red","FALSE" = "lightgrey")) +
+  #   labs(color = str_c("Sig in ","matrix")) +
+  #   facet_wrap(~ ggplotdat[["method"]]) + 
+  #   theme_bw()
+
+```
+
+## D7
+```{r}
+D7_No_adjuvant_volcomp <- compVolcanoFor(res_mat_time,
+               facetGroup = "Group",
+               sigGroup = "No_adjuvant",
+               contrast %in% c("D7")) + ggtitle("D7")
+
+D7_All_volcomp <- compVolcanoFor(res_mat_time,
+               facetGroup = "Group",
+               sigGroup = "All",
+               contrast %in% c("D7")) + ggtitle("D7")
+
+D7_AS03_volcomp <- compVolcanoFor(res_mat_time,
+               facetGroup = "Group",
+               sigGroup = "AS03",
+               contrast %in% c("D7")) + ggtitle("D7")
+
+D7_No_adjuvant_volcomp
+D7_All_volcomp
+D7_AS03_volcomp
+```
+
+```{r}
+compVolcano2For(res_mat_time,
+               facetGroup = "Group",
+               sigGroup = "No_adjuvant",
+               contrast %in% c("D4")) + ggtitle("D4")
+
+compVolcano2For(res_mat_time,
+               facetGroup = "Group",
+               sigGroup = "All",
+               contrast %in% c("D4")) + ggtitle("D4")
+
+compVolcano2For(res_mat_time,
+               facetGroup = "Group",
+               sigGroup = "AS03",
+               contrast %in% c("D4")) + ggtitle("D4")
+
+```
+
+
+```{r}
+compVolcano2For(res_combined,
+               facetGroup = "contrast",
+               sigGroup = "D1",
+               method %in% "matrix",
+               Group %in% "AS03") +
+  ggtitle("AS03 matrix")
+```
+
+
+# common data frame
+
+```{r}
+
+res_matrix <- bind_rows(sapply(model_results[1:8],function(x) {
+  as.data.frame(x) %>%
+    rownames_to_column(var = "gene_id")
+  },
+  simplify = FALSE), .id = "contrast") %>%
+  mutate(Group = str_extract(contrast,".*?(?=[_]D[:digit:])"),
+         contrast = str_extract(contrast,"D[:digit:]"))
+
+res_matrix_full <- bind_rows(sapply(model_results,function(x) {
+  as.data.frame(x) %>%
+    rownames_to_column(var = "gene_id")
+  },
+  simplify = FALSE), .id = "contrast") %>%
+  mutate(Group = if_else(str_starts(contrast,"D"),"Interaction",str_extract(contrast,".*?(?=[_]D[:digit:])")),
+         contrast = str_extract(contrast,"D[:digit:]"))
+
+sep_list <- list(No_adjuvant = sapply(c("D1","D2","D4","D7"),
+       function(x){
+         DESeq2::results(analysis$dds_No_adjuvant,
+                 contrast = list(c(str_c("timepoint_",x,"_vs_D0"))),
+                 filter = maxMinFilter(analysis$dds_No_adjuvant,
+                                       intgroup = "timepoint",
+                                       comp = c(x,"D0")),
+                 alpha = 0.05) %>%
+           as.data.frame() %>%
+           rownames_to_column(var = "gene_id")
+       },
+       simplify = FALSE) %>%
+  bind_rows(.id = "contrast")) # %>% str()
+
+sep_list$AS03 <- sapply(c("D1","D2","D4","D7"),
+       function(x){
+         DESeq2::results(analysis$dds_AS03,
+                 contrast = list(c(str_c("timepoint_",x,"_vs_D0"))),
+                 filter = maxMinFilter(analysis$dds_AS03,
+                                       intgroup = "timepoint",
+                                       comp = c(x,"D0")),
+                 alpha = 0.05) %>%
+           as.data.frame() %>%
+           rownames_to_column(var = "gene_id")
+       },
+       simplify = FALSE) %>%
+  bind_rows(.id = "contrast")
+
+res_separate <- bind_rows(sep_list, .id = "Group")
+
+res_combined <- bind_rows(matrix = res_matrix,
+                          separate = res_separate,
+                          .id = "method")
+
+res_combined$Group = factor(res_combined$Group, levels = c("No_adjuvant","AS03"))
+res_combined$contrast = factor(res_combined$contrast, levels = c("D1","D2","D4","D7"))
+
+# %>% str()
+
+```
+
+```{r fig.height=12}
+
+res_combined %>%
+  filter(
+    method %in% c("matrix"),
+    Group %in% c("AS03")
+  ) %>%
+  group_by(gene_id) %>%
+  mutate(everTested = any(!is.na(padj)),
+            everSig = any(padj < 0.05)) %>%
+  ungroup() %>%
+  filter(everSig == TRUE) %>%
+  mutate(sig = factor(case_when(
+    padj < 0.05 & log2FoldChange > 0 ~ "sigUp",
+    padj < 0.05 & log2FoldChange < 0 ~ "sigDn",
+    .default = "notSig"
+  ),levels = c("sigUp","notSig","sigDn"))) %>%
+  ggplot(aes(x = contrast,
+             alluvium = gene_id,
+             stratum = sig, fill = sig)) +
+  geom_flow(stat = "alluvium") +
+  geom_stratum()
+
+
+```
+
+
+
+```{r}
+filter(res_combined,contrast =="D7",gene_id %in% (filter(res_combined,contrast =="D7",padj < 0.05) %>% pull(gene_id))) %>%
+  pivot_wider(id_cols = c(contrast,gene_id,Group),names_from = method, values_from = stat) %>%
+  # mutate(matrix = if_else(is.na(matrix),true = 0.0,false = matrix),
+  #        separate = if_else(is.na(separate),true = 0.0, false = separate)) %>%
+  ggplot(aes(x=matrix,y=separate,shape=Group)) +
+  geom_abline(intercept = 0,slope = 1,color="red") +
+  geom_point(size = 1) +
+  theme_bw()
+```
+
+```{r}
+
+sigGenesFor <- function(res,...) {
+  filter(res,...) %>%
+    filter(!is.na(padj),
+           padj<0.05) %>%
+    pull(gene_id)
+}
+
+sigUpGenesFor <- function(res,...) {
+  filter(res,...) %>%
+    filter(!is.na(padj),
+           padj<0.05,
+           log2FoldChange > 0) %>%
+    pull(gene_id)
+}
+
+sigUpGenesForByFC <- function(res,...) {
+  filter(res,...) %>%
+    filter(!is.na(padj),
+           padj<0.05,
+           log2FoldChange > 0) %>%
+    arrange(dplyr::desc(log2FoldChange)) %>%
+    pull(gene_id)
+}
+
+sigDnGenesFor <- function(res,...) {
+  filter(res,...) %>%
+    filter(!is.na(padj),
+           padj<0.05,
+           log2FoldChange < 0) %>%
+    pull(gene_id)
+}
+
+volcanoFor <- function(res,...) {
+  filter(res,...) %>%
+    filter(!is.na(padj)) %>%
+  mutate(sigDE = (gene_id %in% sigGenesFor(res_combined,...))) %>%
+           # method %in% c("separate"),
+           # Group %in% c("No_adjuvant"),
+           # # Group %in% c("AS03"),
+           # contrast %in% c("D2")))) %>%
+    # mutate(sigDE = padj < 0.05) %>%
+    ggplot(aes(x=log2FoldChange,
+               y=-log10(pvalue),
+               color = sigDE)) +
+    geom_point(size = 1) +
+    scale_color_manual(values = c("TRUE" = "red","FALSE" = "lightgrey")) +
+    theme_bw()
+}
+
+volcanoUpDnFor <- function(res,upList,dnList,...) {
+  filter(res,...) %>%
+    filter(!is.na(padj)) %>%
+    # mutate(sigDE = case_when(
+    #   gene_id %in% upList ~ TRUE,
+    #   gene_id %in% dnList ~ TRUE,
+    #   .default = FALSE
+    # )) %>%
+    mutate(sigDE = case_when(
+      gene_id %in% upList ~ "A",
+      gene_id %in% dnList ~ "B",
+      .default = "C"
+    )) %>%
+  # mutate(sigDE = (gene_id %in% sigGenesFor(res_combined,...))) %>%
+           # method %in% c("separate"),
+           # Group %in% c("No_adjuvant"),
+           # # Group %in% c("AS03"),
+           # contrast %in% c("D2")))) %>%
+    # mutate(sigDE = padj < 0.05) %>%
+    arrange(desc(sigDE)) %>%
+    ggplot(aes(x=log2FoldChange,
+               y=-log10(pvalue),
+               color = sigDE)) +
+    geom_point(size = 1) +
+    scale_color_manual(values = c("A" = "red","B" = "blue","C" = "lightgrey")) +
+    # scale_color_manual(values = c("TRUE" = "red","FALSE" = "lightgrey")) +
+    theme_bw()
+}
+
+compVolcanoFromList <- function(res, facetGroup, geneList, ...) {
+  ggplotdat <- filter(res,...) %>%
+    filter(!is.na(padj)) %>%
+    mutate(sigInGroup = case_when(gene_id %in% geneList & log2FoldChange > 0 ~ "Up",
+                                  gene_id %in% geneList & log2FoldChange < 0 ~ "Dn",
+                                  .default = "NC",
+                                  .ptype = factor(levels = c("Up","Dn","NC"), ordered = TRUE))) %>%
+    arrange(desc(sigInGroup))
+  ggplot(ggplotdat, aes(x=log2FoldChange,
+               y=-log10(pvalue),
+               color = sigInGroup)) +
+    geom_point(size = 0.33) +
+    scale_color_manual(values = c("Up" = "red","Dn" = "blue","NC" = "lightgrey")) +
+    # labs(color = str_c("Sig in ",sigGroup)) +
+    facet_wrap(~ ggplotdat[[facetGroup]],ncol = 4) + 
+    theme_bw()
+}
+
+compVolcanoFor <- function(res,facetGroup,sigGroup,...) {
+  ggplotdat <- filter(res,...) %>%
+    filter(!is.na(padj)) %>%
+    mutate(sigInGroup = (gene_id %in% sigGenesFor(res,res[[facetGroup]] %in% c(sigGroup),...))) %>%
+    # mutate(sigInGroup = (gene_id %in% sigGenesFor(res_combined,Group %in% c(sigGroup),...))) %>%
+    arrange(sigInGroup)
+  ggplot(ggplotdat, aes(x=log2FoldChange,
+               y=-log10(pvalue),
+               color = sigInGroup)) +
+    geom_point(size = 0.33) +
+    scale_color_manual(values = c("TRUE" = "red","FALSE" = "lightgrey")) +
+    labs(color = str_c("Sig in ",sigGroup)) +
+    facet_wrap(~ ggplotdat[[facetGroup]],ncol=4) + 
+    theme_bw()
+}
+
+compVolcanoUpDnFor <- function(res,facetGroup,upList,dnList,...) {
+  ggplotdat <- filter(res,...) %>%
+    filter(!is.na(padj)) %>%
+    # mutate(sigInGroup = case_when(
+    #   gene_id %in% upList ~ TRUE,
+    #   gene_id %in% dnList ~ TRUE,
+    #   .default = FALSE
+    # )) %>%
+    mutate(sigInGroup = case_when(
+      gene_id %in% upList ~ "AUp",
+      gene_id %in% dnList ~ "BDn",
+      .default = "CNC"
+    )) %>%
+    arrange(desc(sigInGroup))
+
+    ggplot(ggplotdat, aes(x=log2FoldChange,
+               y=-log10(pvalue),
+               color = sigInGroup)) +
+    geom_point(size = 0.33) +
+    scale_color_manual(values = c("AUp" = "red","BDn" = "blue","CNC" = "lightgrey")) +
+    # scale_color_manual(values = c("TRUE" = "red","FALSE" = "lightgrey")) +
+    # labs(color = str_c("Sig in ",sigGroup)) +
+    facet_wrap(~ ggplotdat[[facetGroup]],ncol=4) + 
+    theme_bw()
+}
+
+# compVolcanoFor <- function(res,facetGroup,sigGroup,...) {
+#   ggplotdat <- filter(res,...) %>%
+#     filter(!is.na(padj)) %>%
+#     mutate(sigInGroup = (gene_id %in% sigGenesFor(res_combined,res_combined[[facetGroup]] %in% c(sigGroup),...))) %>%
+#     # mutate(sigInGroup = (gene_id %in% sigGenesFor(res_combined,Group %in% c(sigGroup),...))) %>%
+#     arrange(sigInGroup)
+#   ggplot(ggplotdat, aes(x=log2FoldChange,
+#                y=-log10(pvalue),
+#                color = sigInGroup)) +
+#     geom_point(size = 0.33) +
+#     scale_color_manual(values = c("TRUE" = "red","FALSE" = "lightgrey")) +
+#     labs(color = str_c("Sig in ",sigGroup)) +
+#     facet_wrap(~ ggplotdat[[facetGroup]]) + 
+#     theme_bw()
+# }
+
+compVolcano2For <- function(res,facetGroup,sigGroup,...) {
+  ggplotdat <- filter(res,...) %>%
+    filter(!is.na(padj)) %>%
+    mutate(sigInGroup = case_when(gene_id %in% sigUpGenesFor(res,res[[facetGroup]] %in% c(sigGroup),...) ~ "Up",
+                                  gene_id %in% sigDnGenesFor(res,res[[facetGroup]] %in% c(sigGroup),...) ~ "Dn",
+                                  .default = "NC",
+                                  .ptype = factor(levels = c("Up","Dn","NC"), ordered = TRUE))) %>%
+    # mutate(sigInGroup = (gene_id %in% sigGenesFor(res,res[[facetGroup]] %in% c(sigGroup),...))) %>%
+    # mutate(sigInGroup = (gene_id %in% sigGenesFor(res_combined,Group %in% c(sigGroup),...))) %>%
+    arrange(desc(sigInGroup))
+  ggplot(ggplotdat, aes(x=log2FoldChange,
+               y=-log10(pvalue),
+               color = sigInGroup)) +
+    geom_point(size = 0.33) +
+    scale_color_manual(values = c("Up" = "red","Dn" = "blue","NC" = "lightgrey")) +
+    labs(color = str_c("Sig in ",sigGroup)) +
+    facet_wrap(~ ggplotdat[[facetGroup]],ncol = 4) + 
+    theme_bw()
+}
+
+
+
+
+```
+
+
+```{r fig.height=8.5, fig.width=11}
+# volcano
+
+sigGenesFor(res_combined,
+           method %in% c("separate"),
+           Group %in% c("No_adjuvant"),
+           contrast %in% c("D1"))
+
+volcanoFor(res_combined,
+           method %in% c("separate"),
+           Group %in% c("No_adjuvant"),
+           contrast %in% c("D2"))
+
+compVolcanoFor(res_combined,
+               facetGroup = "Group",
+               sigGroup = "AS03",
+               method %in% c("separate"),
+               contrast %in% c("D7"))
+
+compVolcanoFor(res_combined,
+               facetGroup = "contrast",
+               sigGroup = "D4",
+               method %in% c("separate"),
+               Group %in% c("No_adjuvant"),
+               # contrast %in% c("D7")
+               )
+
+compVolcanoFor(res_combined,
+               facetGroup = "method",
+               sigGroup = "matrix",
+               Group %in% c("AS03"),
+               contrast %in% c("D4"))
+
+res_combined %>%
+  filter(method %in% c("separate"),
+         Group %in% c("AS03"),# "AS03","No_adjuvant"
+         # Group %in% c("No_adjuvant"),
+         contrast %in% c("D2"),
+         !is.na(padj)) %>%
+  mutate(inOtherGroup = (gene_id %in% sigGenesFor(res_combined,
+           method %in% c("separate"),
+           Group %in% c("No_adjuvant"),
+           # Group %in% c("AS03"),
+           contrast %in% c("D2")))) %>%
+  ggplot(aes(x=log2FoldChange,
+             y=-log10(pvalue),
+             color = stat)) +
+             # color = inOtherGroup)) +
+  geom_point(size = 1) +
+  scale_color_gradientn(colors = coolwarm()) +
+  # scale_color_manual(values = c("TRUE" = "red","FALSE" = "lightgrey")) +
+  theme_bw()
+```
+
+```{r fig.height=8.5, fig.width=11}
+# volcano
+
+compVolcanoFor(res_combined,
+               facetGroup = "method",
+               sigGroup = "matrix",
+               Group %in% c("No_adjuvant"),
+               contrast %in% c("D7"))
+
+```
+
+
+```{r fig.height=8.5, fig.width=11}
+# volcano
+
+compVolcanoFor(res_combined,
+               facetGroup = "contrast",
+               sigGroup = "D4",
+               method %in% c("matrix"),
+               Group %in% c("No_adjuvant"))
+
+```
+
+```{r fig.height=8.5, fig.width=11}
+
+upList <- sigUpGenesFor(res_combined,res_combined[["contrast"]] %in% c("D4"),
+                        method %in% c("matrix"),
+                        Group %in% c("No_adjuvant"))
+dnList <- sigDnGenesFor(res_combined,res_combined[["contrast"]] %in% c("D4"),
+                        method %in% c("matrix"),
+                        Group %in% c("No_adjuvant"))
+
+upD1AS03 <- sigUpGenesFor(res_combined,
+                        method %in% c("matrix"),
+                        Group %in% c("AS03"),
+                        contrast %in% c("D1")
+                        )
+upList <- as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+  rownames_to_column(var = "gene_id") %>%
+  filter(!is.na(padj),
+         padj < 0.05) %>%
+  pull("gene_id")
+
+compVolcanoUpDnFor(res_combined,
+               facetGroup = "contrast",
+               upList = intersect(upList,upD1AS03),
+               dnList = "",
+               # dnList = dnList,
+               method %in% c("matrix"),
+               Group %in% c("AS03"))
+
+```
+
+
+
+```{r fig.height=8.5, fig.width=11}
+# volcano
+
+compVolcanoFor(res_combined,
+               facetGroup = "Group",
+               sigGroup = "No_adjuvant",
+               method %in% c("matrix"),
+               contrast %in% c("D4"))
+
+```
+
+## Comp volcano of "good" D1 Interaction genes over time
+
+```{r}
+
+compVolcanoFromList(res_matrix_full,
+                    facetGroup = "contrast",
+                    geneList = intersect(sigUpGenesForD1Interaction,
+                                       sigUpGenesForD1AS03),
+                    Group %in% "AS03") + xlim(-4.56,2.9) + ylim(0,14.36) + ggtitle("\"Good\" D1 interaction in AS03 Group")
+
+compVolcanoFromList(res_matrix_full,
+                    facetGroup = "contrast",
+                    geneList = intersect(sigUpGenesForD1Interaction,
+                                       sigUpGenesForD1AS03),
+                    Group %in% "No_adjuvant") + xlim(-4.56,2.9) + ggtitle("\"Good\" D1 interaction in No_adjuvant Group")
+
+compVolcanoFromList(res_matrix_full,
+                    facetGroup = "contrast",
+                    geneList = setdiff(sigUpGenesForD1AS03,
+                                       sigUpGenesForD1Interaction),
+                    Group %in% "AS03") + xlim(-4.56,2.9) + ylim(0,14.36) + ggtitle("\"Bad\" D1 ASO3 in AS03 Group")
+
+compVolcanoFromList(res_matrix_full,
+                    facetGroup = "contrast",
+                    geneList = setdiff(sigUpGenesForD1AS03,
+                                       sigUpGenesForD1Interaction),
+                    Group %in% "No_adjuvant") + xlim(-4.56,2.9) + ggtitle("\"Bad\" D1 ASO3 in No_adjuvant Group")
+
+```
+
+
+## Comp volcano of "bad" D1 Interaction genes over time
+
+```{r}
+
+compVolcanoFromList(res_matrix_full,
+                    facetGroup = "contrast",
+                    geneList = setdiff(sigUpGenesForD1Interaction,
+                                       sigUpGenesForD1AS03),
+                    Group %in% "AS03") + xlim(-4.56,2.9) + ylim(0,14.36) + ggtitle("\"Bad\" D1 interaction in AS03 Group")
+
+compVolcanoFromList(res_matrix_full,
+                    facetGroup = "contrast",
+                    geneList = setdiff(sigUpGenesForD1Interaction,
+                                       sigUpGenesForD1AS03),
+                    Group %in% "No_adjuvant") + xlim(-4.56,2.9) + ggtitle("\"Bad\" D1 interaction in No_adjuvant Group")
+
+```
+
+
+# Curated Results
+
+```{r}
+
+res_mat_time_full %>%
+  select(c(contrast,gene_id,baseMean,log2FoldChange,pvalue,padj,Group)) %>%
+  pivot_wider(id_cols = c(gene_id,baseMean),
+              names_from = c(contrast,Group),
+              values_from = c(log2FoldChange,pvalue,padj),
+              names_vary = "slowest",
+              names_glue = "{contrast}\n{Group}\n{.value}") %>%
+  arrange(`D1\nInteraction\npvalue`) %>%
+  mutate(concordant = case_when(
+    `D1\nInteraction\npadj` < 0.05 & `D1\nAS03\npadj` < 0.05 ~ "both",
+    `D1\nInteraction\npadj` < 0.05 & `D1\nAS03\npadj` >= 0.05 ~ "interaction",
+    `D1\nInteraction\npadj` >= 0.05 & `D1\nAS03\npadj` < 0.05 ~ "AS03",
+    `D1\nInteraction\npadj` < 0.05 & `D1\nAS03\npadj` < 0.05 ~ "neither"
+  )) %>%
+  relocate(c(1:2,51,27:29,15:17,3:5,18:26,6:14,30:50)) %>%
+  # str()
+  openxlsx::write.xlsx(file = here("outputs/DEG_curated_results_p21257_Tiffany.xlsx"))
+
+
+# res_mat_time_full <- mutate(res_mat_time_full,
+#                             concordant = case_when(
+#                               
+#                             ))
+
+```
+
+
+```{r}
+## local heatmap function???
+```
+
+# Heatmaps
+
+## Heatmap Interaction D1
+
+```{r fig.height=10, fig.width=13}
+
+
+
+heatmapFromGenelist(geneList = as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                      filter(!is.na(padj),
+                             padj < 0.05) %>%
+                      slice_max(order_by = abs(stat),n = 50) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id),
+                    data = normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                                     analysis$dds@colData,
+                                                     group_var = 'timepoint',
+                                                     baseline = 'D0'),
+                    column_split = interaction(analysis$dds$timepoint,analysis$dds$Group),
+                    column_title = "D1 interaction",
+                    slice_labels = levels(interaction(analysis$dds$timepoint,analysis$dds$Group)),
+                    slice_labels_rot = 60,
+                    scale_min = -1,
+                    scale_max = 1
+                    )
+
+# timepointGroupAnnotation = HeatmapAnnotation(Group = levels(analysis$dds$Group),Timepoint = levels(analysis$dds$Group))
+
+Heatmap(normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0')[as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                      filter(!is.na(padj),
+                             padj < 0.05) %>%
+                      slice_max(order_by = abs(stat),n = 50) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$timepoint,analysis$dds$Group),
+        column_title = NULL,
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("","","No_adjuvant","","","","","AS03","",""),
+                                                             gp = gpar(col = NA,fill = NA)),
+                                          Timepoint = anno_block(labels = str_extract(levels(interaction(analysis$dds$timepoint,analysis$dds$Group)),"D[:digit:]")))
+        )
+
+Heatmap(normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0')[as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                      filter(!is.na(padj),
+                             padj < 0.05) %>%
+                      slice_max(order_by = abs(stat),n = 50) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+        column_title = NULL,
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("D0","","D1","","D2","","D4","","D7",""),
+                                                             gp = gpar(col = NA,fill = NA),labels_just = "left"),
+                                          Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),5) ))
+        )
+
+
+```
+
+## Heatmap Interaction D1 not AS03 D1
+
+```{r fig.height=11, fig.width=13}
+
+sigUpGenesForD1Interaction <- sigUpGenesFor(res_matrix_full,Group %in% "Interaction",contrast %in% "D1")
+sigUpGenesForD1AS03 <- sigUpGenesFor(res_matrix_full,Group %in% "AS03",contrast %in% "D1")
+
+sigUpGenesForD1NoAdj <- sigUpGenesFor(res_matrix_full,Group %in% "No_adjuvant",contrast %in% "D1")
+
+sigUpGenesForD1All <- sigUpGenesFor(res_mat_time_full,
+                                    Group %in% "All",
+                                    contrast %in% "D1")
+
+sigDnGenesForD1All <- sigDnGenesFor(res_mat_time_full,
+                                    Group %in% "All",
+                                    contrast %in% "D1")
+
+sigDnGenesForD1NoAdj <- sigDnGenesFor(res_mat_time_full,
+                                      Group %in% "No_adjuvant",
+                                      contrast %in% "D1")
+
+sigDnGenesForD1AS03 <- sigDnGenesFor(res_mat_time_full,
+                                      Group %in% "AS03",
+                                      contrast %in% "D1")
+
+Heatmap(normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0')[as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                        filter(gene_id %in% setdiff(sigUpGenesForD1Interaction,
+                                                    sigUpGenesForD1AS03)) %>%
+                      # filter(!is.na(padj),
+                      #        padj < 0.05) %>%
+                      # slice_max(order_by = abs(stat),n = 50) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$timepoint,analysis$dds$Group),
+        column_title = NULL,
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("","","No_adjuvant","","","","","AS03","",""),
+                                                             gp = gpar(col = NA,fill = NA)),
+                                          Timepoint = anno_block(labels = str_extract(levels(interaction(analysis$dds$timepoint,analysis$dds$Group)),"D[:digit:]")))
+        )
+
+Heatmap(normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0')[as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                        filter(gene_id %in% setdiff(sigUpGenesForD1Interaction,
+                                                    sigUpGenesForD1AS03)) %>%
+                      # filter(!is.na(padj),
+                      #        padj < 0.05) %>%
+                      # slice_max(order_by = abs(stat),n = 50) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+        column_title = NULL,
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("D0","","D1","","D2","","D4","","D7",""),
+                                                             gp = gpar(col = NA,fill = NA),labels_just = "left"),
+                                          Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),5) ))
+        )
+
+```
+
+### Foldchange Heatmap
+
+```{r fig.height=7, fig.width=4}
+Heatmap(normalizeCountsForHeatmapByIndividual(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0',
+                                  individual_var = 'individual')[as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                        filter(gene_id %in% intersect(sigUpGenesForD1Interaction,
+                                                    sigUpGenesForD1AS03)) %>%
+                        filter(!str_starts(gene_id,pattern = "ENSMMUG")) %>%
+                      # filter(!is.na(padj),
+                      #        padj < 0.05) %>%
+                      # slice_max(order_by = abs(stat),n = 50) %>%
+                      # arrange(desc(stat)) %>%
+                      slice_max(order_by = log2FoldChange,n=50) %>%
+                      arrange(desc(log2FoldChange)) %>%
+                      pull(gene_id), c(11:29), drop = FALSE],
+                      # pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        # column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}")[c(11:29)],
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$Group,analysis$dds$timepoint)[c(11:29)],
+        # column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+        column_title = "Top 50 DE Genes",
+        column_title_gp = gpar(fontsize = 8),
+        row_names_gp = gpar(fontsize = 8),
+        column_names_gp = gpar(fontsize = 8),
+        # top_annotation = columnAnnotation(Group = anno_block(labels = c("D0","","D1","","D2","","D4","","D7",""),
+        # top_annotation = columnAnnotation(Group = anno_block(labels = c("D1","D1","D2","D2","D4","D4","D7","D7"),
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("D1","D1","D2","D2"),
+                                                             gp = gpar(col = NA,fill = NA),labels_gp = gpar(fontsize = 8),labels_just = "center"),
+                                          Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),2),
+                                          # Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),4),
+                                          # Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),5),
+                                                                 gp=gpar(col = NA),labels_gp =  gpar(fontsize = 8) ))
+        )
+```
+
+
+## Heatmap AS03 D1
+
+```{r fig.height=121, fig.width=16}
+
+
+
+heatmapFromGenelist(geneList = filter(res_combined,
+                                      method %in% c("matrix"),
+                                      Group %in% c("AS03"),
+                                      contrast %in% c("D1"),
+                                      !is.na(padj),
+                                      padj < 0.05) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id),
+                    data = normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                                     analysis$dds@colData,
+                                                     group_var = 'timepoint',
+                                                     baseline = 'D0'),
+                    column_split = interaction(analysis$dds$timepoint,analysis$dds$Group),
+                    slice_labels = levels(interaction(analysis$dds$timepoint,analysis$dds$Group)),
+                    slice_labels_rot = 60,
+                    scale_min = -2,
+                    scale_max = 2
+                    )
+
+
+```
+
+
+## Heatmap No_adjuvant D4
+
+```{r fig.height=121, fig.width=16}
+
+
+
+heatmapFromGenelist(geneList = filter(res_combined,
+                                      method %in% c("matrix"),
+                                      Group %in% c("No_adjuvant"),
+                                      contrast %in% c("D4"),
+                                      !is.na(padj),
+                                      padj < 0.05) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id),
+                    data = normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                                     analysis$dds@colData,
+                                                     group_var = 'timepoint',
+                                                     baseline = 'D0'),
+                    column_split = interaction(analysis$dds$timepoint,analysis$dds$Group),
+                    slice_labels = levels(interaction(analysis$dds$timepoint,analysis$dds$Group)),
+                    slice_labels_rot = 60)
+
+
+# data_to_plot <- normalizeCountsForHeatmap(assay(plotting_obj),
+#                                       colData(plotting_obj),
+#                                       group_var = 'timepoint',
+#                                       baseline = 'D0')
+# scale_min = -2
+# scale_max = 2
+# heatmapFromGenelist(geneList = getTopNGenes(result, exclude_ENS = TRUE),
+#                     data = data_to_plot,
+#                     column_split = c(rep(1,10), rep(2,9), rep(3,10), rep(4,10), rep(5,10)), column_labels = plotting_obj$individual,
+#                     slice_labels = c('D0', 'D1', 'D2', 'D4', 'D7'),
+#                     slice_labels_rot = 0,
+#                     heatmap_legend_param =  list(at = c(scale_min, 0, scale_max), 
+#         labels = c(scale_min, 0, scale_max), title = "log2 fold\ndifference\nfrom median D0"))
+```
+
+## Heatmap All D4
+
+```{r fig.height=16, fig.width=16}
+
+
+
+heatmapFromGenelist(geneList = filter(res_timepoint,
+                                      contrast %in% c("D4"),
+                                      !is.na(padj),
+                                      padj < 0.05) %>%
+                      slice_max(order_by = abs(stat),n = 30) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id),
+                    data = normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                                     analysis$dds@colData,
+                                                     group_var = 'timepoint',
+                                                     baseline = 'D0'),
+                    column_split = interaction(analysis$dds$timepoint,analysis$dds$Group),
+                    slice_labels = levels(interaction(analysis$dds$timepoint,analysis$dds$Group)),
+                    slice_labels_rot = 60,
+                    scale_min = -1.5,
+                    scale_max = 1.5
+                    )
+
+
+```
+
+## Heatmap for other Interaction genes
+
+```{r fig.width=13}
+
+Heatmap(normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0')[as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                        filter(gene_id %in% sigGenesFor(res_mat_time_full,
+                                                        Group %in% "Interaction",
+                                                        contrast %in% c("D4","D7"))) %>%
+                      # filter(!is.na(padj),
+                      #        padj < 0.05) %>%
+                      # slice_max(order_by = abs(stat),n = 50) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$timepoint,analysis$dds$Group),
+        column_title = NULL,
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("","","No_adjuvant","","","","","AS03","",""),
+                                                             gp = gpar(col = NA,fill = NA)),
+                                          Timepoint = anno_block(labels = str_extract(levels(interaction(analysis$dds$timepoint,analysis$dds$Group)),"D[:digit:]")))
+        )
+
+Heatmap(normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0')[as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                        filter(gene_id %in% sigGenesFor(res_mat_time_full,
+                                                        Group %in% "Interaction",
+                                                        contrast %in% c("D4","D7"))) %>%
+                      # filter(!is.na(padj),
+                      #        padj < 0.05) %>%
+                      # slice_max(order_by = abs(stat),n = 50) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+        column_title = NULL,
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("D0","","D1","","D2","","D4","","D7",""),
+                                                             gp = gpar(col = NA,fill = NA),labels_just = "left"),
+                                          Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),5) ))
+        )
+
+
+```
+
+
+```{r fig.height=29, fig.width=11}
+
+
+
+heatmapFromGenelist(geneList = as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                      filter(!is.na(padj),
+                             padj < 0.05) %>%
+                      # slice_max(order_by = abs(stat),n = 30) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id),
+                    data = normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                                     analysis$dds@colData,
+                                                     group_var = 'timepoint',
+                                                     baseline = 'D0'),
+                    column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+                    column_title = "D1 interaction",
+                    slice_labels = levels(interaction(analysis$dds$Group,analysis$dds$timepoint)),
+                    slice_labels_rot = 60,
+                    scale_min = -1,
+                    scale_max = 1
+                    )
+
+
+```
+
+
+
+## Replot results
+
+### AS03 D1 not significant in interaction
+
+
+```{r fig.height=20, fig.width=11}
+
+geneList_D1_interaction <- as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+  rownames_to_column(var = "gene_id") %>%
+  filter(!is.na(padj),
+         padj < 0.05) %>%
+  arrange(desc(stat)) %>%
+  pull(gene_id)
+
+geneList_AS03_D1 = as.data.frame(model_results$AS03_D1) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                      filter(!is.na(padj),
+                             padj < 0.05) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id)
+
+heatmapFromGenelist(geneList = as.data.frame(model_results$AS03_D1) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                      filter(!is.na(padj),
+                             padj < 0.05,
+                             !(gene_id %in% geneList_D1_interaction)) %>%
+                      slice_max(order_by = abs(stat),n = 100) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id),
+                    data = normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                                     analysis$dds@colData,
+                                                     group_var = 'timepoint',
+                                                     baseline = 'D0'),
+                    column_split = interaction(analysis$dds$timepoint,analysis$dds$Group),
+                    column_title = "AS03_D1 not sig by interaction",
+                    slice_labels = levels(interaction(analysis$dds$timepoint,analysis$dds$Group)),
+                    slice_labels_rot = 60,
+                    scale_min = -1,
+                    scale_max = 1
+                    )
+
+
+```
+
+
+
+```{r fig.height=20, fig.width=11}
+
+geneList_D1_interaction <- as.data.frame(model_results$D1_AS03.v.No_adjuvant) %>%
+  rownames_to_column(var = "gene_id") %>%
+  filter(!is.na(padj),
+         padj < 0.05) %>%
+  arrange(desc(stat)) %>%
+  pull(gene_id)
+
+geneList_AS03_D1 = as.data.frame(model_results$AS03_D1) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                      filter(!is.na(padj),
+                             padj < 0.05) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id)
+
+heatmapFromGenelist(geneList = as.data.frame(model_results$AS03_D1) %>%
+                      rownames_to_column(var = "gene_id") %>%
+                      filter(!is.na(padj),
+                             padj < 0.05,
+                             !(gene_id %in% geneList_D1_interaction)) %>%
+                      slice_max(order_by = abs(stat),n = 100) %>%
+                      arrange(desc(stat)) %>%
+                      pull(gene_id),
+                    data = normalizeCountsForHeatmap(assay(assays(analysis$dds)$rld),
+                                                     analysis$dds@colData,
+                                                     group_var = 'timepoint',
+                                                     baseline = 'D0'),
+                    column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+                    column_title = "AS03_D1 not sig by interaction",
+                    slice_labels = levels(interaction(analysis$dds$Group,analysis$dds$timepoint)),
+                    slice_labels_rot = 60,
+                    scale_min = -1,
+                    scale_max = 1
+                    )
+
+
+```
+
+
+
+
+```{r}
+## create subject rlog fold change table
+
+rlogFC <- left_join(as.data.frame(colData(assays(analysis$dds)$rld)),
+                    as.data.frame(assay(assays(analysis$dds)$rld)) %>% 
+                      rownames_to_column(var = "Gene") %>% 
+                      pivot_longer(!Gene,
+                                   names_to = "FileID") %>% 
+                      pivot_wider(names_from = Gene,
+                                  values_from = value)) %>%
+  select(-c(ellipse,sizeFactor,replaceable)) %>%
+  grou
+```
+
+
+
+# Functions
+
+```{r DGE_table_function}
+## Can edit this if you want to adjust visualization outputs
+generateDGEDatatable <- function(result,
+                                 alpha = analysis$analysis_config$alpha){
+  dge_data <- data.frame(result) %>% 
+    rownames_to_column('Gene') %>% 
+    arrange(pvalue) %>%
+    select(Gene, baseMean, log2FoldChange, lfcSE, padj) %>% 
+    filter(padj < alpha) %>% 
+    mutate(baseMean=round(baseMean))%>%
+    na.omit() 
+  
+  DT::datatable(dge_data,
+    rownames = FALSE,
+    colnames = c('Gene',
+      'Base mean expression', 
+      'Log2 fold change',
+      'Fold change std. error', 
+      'Adj. p-value'), 
+    caption='DESeq2 output for this comparison, significant genes only',
+    filter='top',
+    autoHideNavigation = TRUE,
+    extensions = c('Buttons', 'Scroller'),
+    options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv'),
+      deferRender = TRUE
+    )) %>%
+    formatRound(c('log2FoldChange','lfcSE'), digits=2) %>%
+    formatSignif('padj')
+}
+```
+
+```{r GSEA_table_function}
+## Can edit this if you want to adjust visualization outputs
+generateGSEADatatable <- function(GSEA_result){
+  gsea_data <- GSEA_result %>%
+    filter(size>5) %>%
+    arrange(pval) %>%
+    group_by(source) %>%
+    slice_head(n=25) %>% 
+    select(pathway, source, pval,padj,NES,size) %>%
+    arrange(pval)
+  
+  DT::datatable(gsea_data,
+    rownames = FALSE,
+    filter='top',
+    autoHideNavigation = TRUE,
+    extensions = c('Buttons', 'Scroller'),
+    options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv'),
+      pageLength = 15,
+      deferRender = TRUE
+    ),
+    caption='GSEA enrichment results, top from each source') %>%
+  formatRound(c('pval','padj','NES'), digits=3)
+}
+```
+
+```{r}
+p21257_heatmaps <- function(geneList,
+                                baseline_grouping = NULL,
+                                baseline = NULL,
+                                column_split = c(rep(1,10), rep(2,9), rep(3,10),
+                                                 rep(4,10), rep(5,10)),
+                                slice_labels = c('D0', 'D1', 'D2', 'D4', 'D7'),
+                                colors = c("blue", "white", "red"),
+                                data = SummarizedExperiment::assays(analysis$dds)$rld,
+                                column_labels = colnames(data),
+                                slice_labels_rot = 90,
+                                box_width = unit(3.5, "mm"),
+                                box_height = unit(3.5, "mm"),
+                                width_buffer = unit(5, "mm"),
+                                height_buffer = unit(10, "mm"),
+                                column_title = " ",
+                                cluster_rows = FALSE,
+                                cluster_columns = FALSE,
+                                column_gap = unit(2, "mm"),
+                                scale_min = -2,
+                                scale_max = 2,
+                                heatmap_legend_param = list(
+                                  at = c(scale_min, 0, scale_max),
+                                  labels = c(scale_min,0,scale_max),
+                                  title = 'log2 fold\ndifference\nfrom\nmedian\nexpression'
+                                ),
+                                ...) {
+  duds <- geneList[!geneList %in% rownames(data)]
+  if (length(duds) > 0){
+    geneList <- geneList[geneList %in% rownames(data)]
+    if (length(geneList) == 0){
+      stop('No data for requested genes')
+    } else {
+      message(paste0('Genes ', paste0(duds, collapse = ', '), ' not found in data'))
+    }
+  }
+  hmap <- data[geneList, ]
+  if (is.null(baseline_grouping) | is.null(baseline)) {
+    message('Basline grouping or baseline level not specified, using all samples
+            to generate median expression per gene')
+    baseline <- matrixStats::rowMedians(SummarizedExperiment::assay(hmap))
+  } else if (!baseline_grouping %in% colnames(colData(data))) {
+    stop("Argument 'baseline_grouping' should be in colData(data)")
+  } else if (!baseline %in% unique(colData(data)[[baseline_grouping]])) {
+    stop("Argument 'baseline' should be a level of 'baseline_grouping' in colData(data)")
+  } else{
+    baseline <- matrixStats::rowMedians(SummarizedExperiment::assay(hmap[, as.character(hmap@colData[[baseline_grouping]]) %in% baseline]))
+  }
+  hmap <- SummarizedExperiment::assay(hmap) - baseline
+  ComplexHeatmap::Heatmap(hmap,
+    heatmap_legend_param = heatmap_legend_param,
+    #border = "black",
+    width = ncol(hmap) * box_width + width_buffer,
+    height = nrow(hmap) * box_height + height_buffer,
+    #rect_gp = grid::gpar(color = "black"),
+    column_title = column_title,
+    cluster_rows = cluster_rows,
+    cluster_columns = cluster_columns,
+    column_split = column_split,
+    top_annotation = (if (!is.null(slice_labels)) {
+      if (is.null(column_split)) {
+        warning("Setting labels requires slices to also be set")
+      }
+      ComplexHeatmap::HeatmapAnnotation(foo = ComplexHeatmap::anno_block(
+        gp = gpar(col = NA),
+        labels = slice_labels,
+        labels_gp = gpar(col = "black", fontsize = 10),
+        labels_rot = slice_labels_rot, height = unit(2, "cm")
+      ))
+    } else {
+      NULL
+    }),
+    column_gap = column_gap,
+    column_labels = column_labels, 
+    col = circlize::colorRamp2(c(scale_min, 0, scale_max), colors),
+    ...
+  )
+}
+```
+
+# Overall
+
+```{r}
+tmp <- data.table::rbindlist(lapply(model_results, function(x) {
+  up <- x %>% as.data.frame() %>% filter(log2FoldChange > 0) %>% filter(padj<0.05) %>% nrow()
+  down <- x %>% as.data.frame() %>% filter(log2FoldChange < 0) %>% filter(padj<0.05) %>% nrow()
+  return(list(up=up, down=down))
+}))
+
+tmp <- cbind(timepoint = c('D1', 'D2', 'D4', 'D7'), tmp[1:4,], tmp[5:8,], tmp[9:12,])
+overall_table <- tmp %>%
+  knitr::kable(digits = 3) %>%
+  kableExtra::add_header_above(c('', 'No_adjuvant' = 2, 'AS03' = 2, 'Interaction' = 2))
+overall_table
+```
+
+```{r}
+sig_res_matrix_full_table <- filter(res_matrix_full,
+                                    !is.na(padj),
+                                    padj < 0.05) %>% 
+  mutate(contrast = factor(contrast,
+                           levels = c("D1","D2","D4","D7")),
+         Group = factor(Group,
+                        levels = c("Interaction","AS03","No_adjuvant")),
+         direction = factor(if_else(log2FoldChange > 0,"up","down"),
+                            levels = c("up","down"))) %>%
+  arrange(contrast,Group,dplyr::desc(log2FoldChange)) %>%
+  group_by(contrast,Group,direction) %>%
+  summarise(sigCount = n(),
+            sigGenes = list(gene_id)) 
+sig_res_mat_time_full_table <- filter(res_mat_time_full,
+                                    !is.na(padj),
+                                    padj < 0.05) %>% 
+  mutate(contrast = factor(contrast,
+                           levels = c("D1","D2","D4","D7")),
+         Group = factor(Group,
+                        levels = c("Interaction","All","AS03","No_adjuvant")),
+         direction = factor(if_else(log2FoldChange > 0,"up","down"),
+                            levels = c("up","down"))) %>%
+  arrange(contrast,Group,dplyr::desc(log2FoldChange)) %>%
+  group_by(contrast,Group,direction) %>%
+  summarise(sigCount = n(),
+            sigGenes = list(gene_id)) 
+```
+## Various overlaps
+
+```{r}
+
+## "distinct" means up(or down) in Group and Interaction, shouldn't be the same direction in alternate Group
+## "common" means up(or down) in Group and All, shouldn't be the other direction in alternate Group
+## "shared" means up(or down) in both Groups
+
+# (547) genes that are up on D1 in AS03
+filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist()
+
+# (302) genes that are down on D1 in AS03
+filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist()
+
+# (49) genes that are up on D1 in No_adjuvant
+filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist()
+
+# (22) genes that are down on D1 in No_adjuvant
+filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist()
+
+# (181) genes that are up on D1 in Interaction
+filter(sig_res_mat_time_full_table,contrast == "D1",Group == "Interaction",direction == "up") %>% pull(sigGenes) %>% unlist()
+
+# (124) genes that are up on D1 in AS03 and Interaction "distinct"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "Interaction",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+
+# (0) genes that are up on D1 in No_adjuvant and Interaction "distinct
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "Interaction",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+## no genes down in interaction so none would be down in intersection with vaccine groups
+
+# (27) genes that are up on D1 in All
+filter(sig_res_mat_time_full_table,contrast == "D1", Group == "All", direction == "up") %>% pull(sigGenes) %>% unlist()
+
+# (53) genes that are down on D1 in All
+filter(sig_res_mat_time_full_table,contrast == "D1", Group == "All", direction == "down") %>% pull(sigGenes) %>% unlist()
+
+# (1) genes that are up on D1 in AS03 and No_adjuvant "shared"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (10) genes that are up on D1 in AS03 and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (7) genes that are up on D1 in No_adjuvant and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (16) genes that are up on D1 in All and either AS03 or No_adjuvant
+union(intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),
+                filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist()),
+      intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),
+                filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist()))
+
+# (1) genes that are up on D1 in AS03, No_adjuvant and All "shared" and "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),
+          intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),
+                    filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist()))
+
+# (5) genes that are down on D1 in AS03 and No_adjuvant "shared"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (30) genes that are down on D1 in AS03 and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (12) genes that are down on D1 in No_adjuvant and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (37) genes that are down on D1 in All and either AS03 or No_adjuvant
+union(intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist()),intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist()))
+
+# (5) genes that are down on D1 in AS03, No_adjuvant and All "shared" and "common"
+intersect(intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist()),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+
+## D2
+
+# (59) genes that are up on D2 in AS03
+filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist()
+
+# (28) genes that are down on D2 in AS03
+filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist()
+
+# (182) genes that are up on D2 in No_adjuvant
+filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist()
+
+# (163) genes that are down on D2 in No_adjuvant
+filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist()
+
+# (282) genes that are up on D2 in All
+filter(sig_res_mat_time_full_table,contrast == "D2", Group == "All", direction == "up") %>% pull(sigGenes) %>% unlist()
+
+# (213) genes that are down on D2 in All
+filter(sig_res_mat_time_full_table,contrast == "D2", Group == "All", direction == "down") %>% pull(sigGenes) %>% unlist()
+
+# (13) genes that are up on D2 in AS03 and No_adjuvant "shared"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist(),
+          filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (29) genes that are up on D2 in AS03 and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (130) genes that are up on D2 in No_adjuvant and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (146) genes that are up on D2 in All and either AS03 or No_adjuvant
+union(intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),
+                filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist()),
+      intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),
+                filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist()))
+
+# (13) genes that are up on D2 in AS03, No_adjuvant and All "shared" and "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),
+          intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),
+                    filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist()))
+
+# (13) genes that are down on D2 in AS03 and No_adjuvant "shared"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (23) genes that are down on D2 in AS03 and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (102) genes that are down on D2 in No_adjuvant and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),
+          filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (111) genes that are down on D2 in All and either AS03 or No_adjuvant
+union(intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),
+                filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist()),
+      intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),
+                filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist()))
+
+# (13) genes that are down on D2 in AS03, No_adjuvant and All "shared" and "common"
+intersect(intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D2",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist()),filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+
+## D4
+
+# (2) genes that are up on D4 in Interaction
+filter(sig_res_mat_time_full_table,contrast == "D4",Group == "Interaction",direction == "up") %>% pull(sigGenes) %>% unlist()
+
+# (1) genes that are down on D4 in Interaction
+filter(sig_res_mat_time_full_table,contrast == "D4",Group == "Interaction",direction == "down") %>% pull(sigGenes) %>% unlist()
+
+# (0) genes that are up on D4 in AS03 and Interaction "distinct"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "Interaction",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (0) genes that are up on D4 in No_adjuvant and Interaction "distinct
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "Interaction",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (0) genes that are down on D4 in AS03 and Interaction "distinct"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "Interaction",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (0) genes that are down on D4 in No_adjuvant and Interaction "distinct
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "Interaction",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+
+# (921) genes that are up on D4 in All
+filter(sig_res_mat_time_full_table,contrast == "D4", Group == "All", direction == "up") %>% pull(sigGenes) %>% unlist()
+
+# (1151) genes that are down on D4 in All
+filter(sig_res_mat_time_full_table,contrast == "D4", Group == "All", direction == "down") %>% pull(sigGenes) %>% unlist()
+
+# (92) genes that are up on D4 in AS03 and No_adjuvant "shared"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (125) genes that are up on D4 in AS03 and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (590) genes that are up on D4 in No_adjuvant and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# (90) genes that are up on D4 in AS03, No_adjuvant and All "shared" and "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "All",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "No_adjuvant",direction == "up") %>% pull(sigGenes) %>% unlist()))
+
+# (127) genes that are down on D4 in AS03 and No_adjuvant "shared"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (128) genes that are down on D4 in AS03 and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (934) genes that are down on D4 in No_adjuvant and All "common"
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+# (118) genes that are down on D4 in AS03, No_adjuvant and All "shared" and "common"
+intersect(intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "All",direction == "down") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "No_adjuvant",direction == "down") %>% pull(sigGenes) %>% unlist()),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "down") %>% pull(sigGenes) %>% unlist())
+
+
+
+
+# genes that are up on D1 and D2 in AS03
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# genes that are up on D1 and D4 in AS03
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# genes that are up on D1 and D7 in AS03
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D7",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# genes that are up on D2 and D4 in AS03
+intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# genes that are up on D2 and D7 in AS03
+intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D7",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# genes that are up on D4 and D7 in AS03
+intersect(filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D7",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# genes that are up on D1, D2 and D4 in AS03
+intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),intersect(filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist()))
+
+# genes that are both up on D1 in AS03 and Interaction and still up on D2 in AS03
+intersect(intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "Interaction",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist()),filter(sig_res_mat_time_full_table,contrast == "D2",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+
+# genes that are both up on D1 in AS03 and Interaction and still up on D4 in AS03
+intersect(intersect(filter(sig_res_mat_time_full_table,contrast == "D1",Group == "Interaction",direction == "up") %>% pull(sigGenes) %>% unlist(),filter(sig_res_mat_time_full_table,contrast == "D1",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist()),filter(sig_res_mat_time_full_table,contrast == "D4",Group == "AS03",direction == "up") %>% pull(sigGenes) %>% unlist())
+```
+
+```{r}
+
+DEG_df <- select(sig_res_mat_time_full_table,-sigGenes) %>% ungroup()
+
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D0",Group = "AS03",direction = "up",sigCount = 0))
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D0",Group = "AS03",direction = "down",sigCount = 0))
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D0",Group = "No_adjuvant",direction = "up",sigCount = 0))
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D0",Group = "No_adjuvant",direction = "down",sigCount = 0))
+
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D0",Group = "Distinct",direction = "up",sigCount = 0))
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D0",Group = "Distinct",direction = "down",sigCount = 0))
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D0",Group = "Common",direction = "up",sigCount = 0))
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D0",Group = "Common",direction = "down",sigCount = 0))
+
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D1",Group = "Distinct",direction = "up",sigCount = 124))
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D1",Group = "Distinct",direction = "down",sigCount = 0))
+# Up in All and either AS03 or No_adjuvant
+# DEG_df <- add_row(DEG_df,tibble_row(contrast = "D1",Group = "Common",direction = "up",sigCount = 16))
+# Up in All and  AS03 and No_adjuvant
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D1",Group = "Common",direction = "up",sigCount = 1))
+# Down All and either AS03 or No_adjuvant
+# DEG_df <- add_row(DEG_df,tibble_row(contrast = "D1",Group = "Common",direction = "down",sigCount = 37))
+# Down All and  AS03 and No_adjuvant
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D1",Group = "Common",direction = "down",sigCount = 5))
+
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D2",Group = "Distinct",direction = "up",sigCount = 0))
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D2",Group = "Distinct",direction = "down",sigCount = 0))
+# Up in All and either AS03 or No_adjuvant
+# DEG_df <- add_row(DEG_df,tibble_row(contrast = "D2",Group = "Common",direction = "up",sigCount = 146))
+# Up in All and  AS03 and No_adjuvant
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D2",Group = "Common",direction = "up",sigCount = 5))
+# Down in All and either AS03 or No_adjuvant
+# DEG_df <- add_row(DEG_df,tibble_row(contrast = "D2",Group = "Common",direction = "down",sigCount = 111))
+# Down in All and AS03 and No_adjuvant
+DEG_df <- add_row(DEG_df,tibble_row(contrast = "D2",Group = "Common",direction = "down",sigCount = 13))
+
+filter(DEG_df,contrast %in% c("D0","D1","D2"), Group %in% c("AS03","No_adjuvant","Distinct","Common")) %>%
+  mutate(sigCount = if_else(direction == "up",sigCount,-sigCount)) %>%
+  ggplot(aes(x=contrast, y=sigCount,group = interaction(Group,direction), color = Group)) +
+  geom_line() +
+  theme_bw()
+
+group_colors = c("Adjuvanted" = "blue","Unadjuvanted" = "magenta","Distinct" = "red","Common" = "grey")
+DE_plot <- DEG_df %>% mutate(Group = case_match(Group,
+"Distinct" ~ "Distinct",
+"Common" ~ "Common",
+"AS03" ~ "Adjuvanted",
+"No_adjuvant" ~ "Unadjuvanted",
+"Interaction" ~ "Interaction",
+"All" ~ "All",
+.ptype = factor(levels = c("Distinct","Common","Adjuvanted","Unadjuvanted","Interaction","All"), ordered = TRUE))) %>%
+  filter(contrast %in% c("D0","D1","D2"),
+         Group %in% c("Adjuvanted","Unadjuvanted","Distinct","Common")) %>%
+  mutate(sigCount = if_else(direction == "up",sigCount,-sigCount)) %>%
+  ggplot(aes(x=contrast, y=sigCount,group = interaction(Group,direction), color = Group)) +
+  # ggplot(aes(x=`Day post vaccination`, y=`DE Genes`,group = interaction(Group,direction), color = Group)) +
+  scale_color_manual(values = group_colors) +
+  geom_line() +
+  # geom_line(aes(linewidth = if_else(Group %in% c("Distinct","Common"),0.05,0.025))) +
+  guides(linewidth = "none") +
+  xlab(label = "Day post vaccination") +
+  ylab(label = "DE genes") +
+  theme_bw()
+
+DE_plot
+
+```
+
+# Comparison 1
+
+```{r}
+# result <- model_results[[1]]
+# result <- model_results$AS03_D1
+# result <- model_results$No_adjuvant_D7
+result <- model_results$D1_AS03.v.No_adjuvant
+```
+
+```{r}
+summary(result)
+```
+
+```{r}
+generateVolcanoPlot(result)
+```
+
+```{r}
+generateDGEDatatable(result)
+```
+
+```{r, fig.height=8, fig.width=14}
+## This is a complicated example to show functionality. You can normalize the
+## expression to the median of a group of samples using baseline_grouping 
+## and baseline_group arguments, where baseline_grouping is a metadata column
+## and baseline_group is a level of that column. If you just want to use all samples 
+## to calculate median expression, leave one of the baseline arguments as NULL. 
+## Column splitting separates samples into blocks based on the column number.
+## e.g. column split = c(rep(1,3), rep(2,4), rep(3,8)) makes the first block have 
+## 3 samples, the second have 4, and the third have 8. Labels can be provided
+## with slice_labels
+# data_to_plot <- normalizeCountsForHeatmapByIndividual(assay(plotting_obj),
+#                                       colData(plotting_obj),
+#                                       group_var = 'timepoint',
+#                                       baseline = 'D0', 
+#                                       individual_var = 'individual')
+data_to_plot <- normalizeCountsForHeatmap(assay(plotting_obj),
+                                      colData(plotting_obj),
+                                      group_var = 'timepoint',
+                                      baseline = 'D0')
+scale_min = -2
+scale_max = 2
+heatmapFromGenelist(geneList = getTopNGenes(result, exclude_ENS = TRUE),
+                    data = data_to_plot,
+                    column_split = c(rep(1,10), rep(2,9), rep(3,10), rep(4,10), rep(5,10)), column_labels = plotting_obj$individual,
+                    slice_labels = c('D0', 'D1', 'D2', 'D4', 'D7'),
+                    slice_labels_rot = 0,
+                    heatmap_legend_param =  list(at = c(scale_min, 0, scale_max), 
+        labels = c(scale_min, 0, scale_max), title = "log2 fold\ndifference\nfrom median D0"))
+```
+
+***
+
+# Genes of interest
+
+```{r}
+heatmaps <- list()
+```
+
+
+```{r fig.height=10, fig.width=12}
+## creating an arbitrary genelist
+geneList <- unique(unlist(lapply(model_results, getTopNGenes, N=5)))
+
+
+# data_to_plot <- normalizeCountsForHeatmapByIndividual(assay(plotting_obj),
+#                                       colData(plotting_obj),
+#                                       group_var = 'timepoint',
+#                                       baseline = 'D0', 
+#                                       individual_var = 'individual')
+
+data_to_plot <- normalizeCountsForHeatmap(assay(plotting_obj),
+                                      colData(plotting_obj),
+                                      group_var = 'timepoint',
+                                      baseline = 'D0')
+
+## Pass in a genelist
+scale_min = -2
+scale_max = 2
+heatmaps[['top_from_study']] <- 
+  heatmapFromGenelist(geneList = geneList,
+                    data = data_to_plot,
+                    column_split = c(rep(1,10), rep(2,9), rep(3,10), rep(4,10), rep(5,10)), column_labels = plotting_obj$individual,
+                    slice_labels = c('D0', 'D1', 'D2', 'D4', 'D7'),
+                    slice_labels_rot = 0,
+                    heatmap_legend_param =  list(at = c(scale_min, 0, scale_max), 
+        labels = c(scale_min, 0, scale_max), title = "log2 fold\ndifference\nfrom median D0"))
+heatmaps[['top_from_study']]
+```
+
+```{r, fig.height=7, fig.width=12}
+## creating an arbitrary genelist
+geneList <- c('CXCL10',
+'IFI27',
+'IFI44L',
+'IFI6',
+'IFIT2',
+'IFIT3',
+'IFIT5',
+'IRF7',
+'ISG15',
+'ISG20',
+'MX1',
+'MX2',
+'OAS1',
+'OAS2',
+'RSAD2',
+'STAT1')
+
+
+
+# data_to_plot <- normalizeCountsForHeatmapByIndividual(assay(plotting_obj),
+#                                       colData(plotting_obj),
+#                                       group_var = 'timepoint',
+#                                       baseline = 'D0', 
+#                                       individual_var = 'individual')
+
+data_to_plot <- normalizeCountsForHeatmap(assay(plotting_obj),
+                                      colData(plotting_obj),
+                                      group_var = 'timepoint',
+                                      baseline = 'D0')
+
+## Pass in a genelist
+scale_min = -2
+scale_max = 2
+heatmaps[['ISGs']] <- 
+  heatmapFromGenelist(geneList = geneList,
+                    data = data_to_plot,
+                    column_split = c(rep(1,10), rep(2,9), rep(3,10), rep(4,10), rep(5,10)), column_labels = plotting_obj$individual,
+                    slice_labels = c('D0', 'D1', 'D2', 'D4', 'D7'),
+                    slice_labels_rot = 0,
+                    heatmap_legend_param =  list(at = c(scale_min, 0, scale_max), 
+        labels = c(scale_min, 0, scale_max), title = "log2 fold\ndifference\nfrom median D0"))
+heatmaps[['ISGs']]
+```
+
+
+***
+
+# GSEA
+
+```{r}
+gsea_plots <- list()
+```
+
+```{r GSEA_setup}
+gmt.file <- list()
+
+## See available genesets
+# msigdbr_species()
+# all_gene_sets = msigdbr(species = "Homo sapiens")
+# head(all_gene_sets)
+
+m_t2g_reactome <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME") %>% 
+  dplyr::select(gene_symbol, gs_name)
+m_t2g_biocarta <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:BIOCARTA") %>% 
+  dplyr::select(gene_symbol, gs_name)
+m_t2g_kegg <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>% 
+  dplyr::select(gene_symbol, gs_name)
+m_t2g_h <- msigdbr(species = "Homo sapiens", category = "H") %>% 
+  dplyr::select(gene_symbol, gs_name)
+gmt.file <- unstack(bind_rows(m_t2g_reactome,m_t2g_h,m_t2g_biocarta,m_t2g_kegg))
+
+## Manually specify gmt.files
+##gmt.file <- append(gmt.file, gmtPathways(file.path(a)))
+```
+
+### individual
+
+```{r, fig.height=10}
+## run individual results
+
+gsea_results <- lapply(model_results, runfgsea, pathways = gmt.file, 
+                       minSize = 10,
+                       breakdown_pathway_names = TRUE)
+```
+
+### gsea All
+
+```{r}
+res_timepoint_deseq <- sapply(levels(analysis$dds_timepoint$timepoint)[-1],
+                  function(x) {
+                    results(analysis$dds_timepoint,
+                            contrast = list(c(str_c("timepoint_",x,"_vs_D0"))),
+                            filter = maxMinFilter(analysis$dds_timepoint,
+                                                  intgroup = "timepoint",
+                                                  comp = c(x,"D0")),
+                            alpha = 0.05)                  },
+                  simplify = FALSE)
+names(res_timepoint_deseq) <- str_c("All_",names(res_timepoint_deseq))
+
+gsea_all_results <- lapply(res_timepoint_deseq, runfgsea, pathways = gmt.file,
+                           minSize = 10,
+                           breakdown_pathway_names = TRUE)
+
+```
+
+```{r fig.height=11, fig.width=11}
+filter(gsea_all_results$All_D4,
+       str_starts(pathway,"HALLMARK")) %>%
+  ggplot(aes(x=NES,
+             y=-log10(pval),
+             label=pathway)) +
+  geom_point() +
+  geom_text_repel(size = 3,max.overlaps = 50)
+```
+
+```{r}
+joint_GSEA_curated_results <- combine_GSEA_results(gsea_results)
+
+joint_GSEA_curated_results %>% filter(source == 'HALLMARK',
+                                      str_detect(ID,"D1")) %>%
+  select(c(ID,pathway,pval,padj,NES,size,leadingEdge,source,pathway_short)) %>%
+  pivot_wider(id_cols = c(pathway,size,source,pathway_short),
+              names_from = c(ID),
+              values_from = c(NES,pval,padj,leadingEdge),
+              names_vary = "slowest",
+              names_glue = "{ID}_{.value}") %>%
+  relocate(c(1:4,13:16,9:12,5:8)) %>%
+  arrange(desc(`D1_AS03.v.No_adjuvant_NES`)) %>%
+  openxlsx::write.xlsx(file = here("outputs/GSEA_curated_results_p21257_Tiffany.xlsx"))
+  # str()
+
+```
+
+
+```{r fig.height=11, fig.width=8}
+
+gseaDotplot_joint(joint_GSEA_curated_results %>% filter(source == 'HALLMARK',
+                                                        str_detect(ID,"D[12]"),
+                                                        pathway %in% (filter(joint_GSEA_curated_results,
+                                                                            source == 'HALLMARK',
+                                                                            ID=='D1_AS03.v.No_adjuvant') %>%
+                                                          filter(pval<0.05) %>%
+                                                          arrange(NES) %>%
+                                                          pull(pathway))),
+                  pathway_order = filter(joint_GSEA_curated_results,source == 'HALLMARK',
+                                         ID=='D1_AS03.v.No_adjuvant') %>% filter(pval<0.05) %>% arrange(NES) %>% pull(pathway),
+                  x_order = c("D1_AS03.v.No_adjuvant",
+                              "AS03_D1",
+                              "No_adjuvant_D1",
+                              "D2_AS03.v.No_adjuvant",
+                              "AS03_D2",
+                              "No_adjuvant_D2")) + theme(axis.text.y = element_text(size = 8))
+```
+
+### Foldchange Heatmaps
+
+```{r fig.height=22, fig.width=11}
+Heatmap(normalizeCountsForHeatmapByIndividual(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0',
+                                  individual_var = 'individual')[filter(joint_GSEA_curated_results,source == 'HALLMARK',ID=='D1_AS03.v.No_adjuvant',pathway == "HALLMARK_INTERFERON_GAMMA_RESPONSE") %>% pull(leadingEdge) %>% unlist(), c(11:49), drop = FALSE],
+                      # pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        # column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}")[c(11:49)],
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$Group,analysis$dds$timepoint)[c(11:49)],
+        # column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+        column_title = "INTERFERON_GAMMA_RESPONSE",
+        # top_annotation = columnAnnotation(Group = anno_block(labels = c("D0","","D1","","D2","","D4","","D7",""),
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("D1","D1","D2","D2","D4","D4","D7","D7"),
+                                                             gp = gpar(col = NA,fill = NA),labels_just = "left"),
+                                          Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),4),
+                                          # Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),5),
+                                                                 gp=gpar(col = NA) ))
+        )
+```
+
+
+```{r fig.height=7, fig.width=4}
+Heatmap(normalizeCountsForHeatmapByIndividual(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0',
+                                  individual_var = 'individual')[filter(joint_GSEA_curated_results,source == 'HALLMARK',ID=='D1_AS03.v.No_adjuvant',pathway == "HALLMARK_INTERFERON_GAMMA_RESPONSE") %>% select(leadingEdge) %>% pull(leadingEdge) %>% unlist() %>% magrittr::extract(1:50), c(11:29), drop = FALSE],
+                      # pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        # column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}")[c(11:29)],
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$Group,analysis$dds$timepoint)[c(11:29)],
+        # column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+        column_title = "INTERFERON_GAMMA_RESPONSE",
+        column_title_gp = gpar(fontsize = 8),
+        row_names_gp = gpar(fontsize = 8),
+        column_names_gp = gpar(fontsize = 8),
+        # top_annotation = columnAnnotation(Group = anno_block(labels = c("D0","","D1","","D2","","D4","","D7",""),
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("D1","D1","D2","D2"),
+                                                             gp = gpar(col = NA,fill = NA),labels_gp = gpar(fontsize = 8),labels_just = "left"),
+                                          Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),2),
+                                          # Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),5),
+                                                                 gp=gpar(col = NA),labels_gp = gpar(fontsize = 8) ))
+        )
+```
+
+
+
+```{r fig.height=11, fig.width=11}
+Heatmap(normalizeCountsForHeatmapByIndividual(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0',
+                                  individual_var = 'individual')[filter(joint_GSEA_curated_results,source == 'HALLMARK',ID=='D1_AS03.v.No_adjuvant',pathway == "HALLMARK_IL6_JAK_STAT3_SIGNALING") %>% pull(leadingEdge) %>% unlist(), c(11:49), drop = FALSE],
+                      # pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        # column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}")[c(11:49)],
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$Group,analysis$dds$timepoint)[c(11:49)],
+        # column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+        column_title = "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+        # top_annotation = columnAnnotation(Group = anno_block(labels = c("D0","","D1","","D2","","D4","","D7",""),
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("D1","D1","D2","D2","D4","D4","D7","D7"),
+                                                             gp = gpar(col = NA,fill = NA),labels_just = "left"),
+                                          Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),4),
+                                          # Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),5),
+                                                                 gp=gpar(col = NA) ))
+        )
+```
+
+
+```{r fig.height=11, fig.width=11}
+Heatmap(normalizeCountsForHeatmapByIndividual(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0',
+                                  individual_var = 'individual')[filter(joint_GSEA_curated_results,source == 'HALLMARK',ID=='D1_AS03.v.No_adjuvant',pathway == "HALLMARK_COMPLEMENT") %>% pull(leadingEdge) %>% unlist(), c(11:49), drop = FALSE],
+                      # pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        # column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}")[c(11:49)],
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$Group,analysis$dds$timepoint)[c(11:49)],
+        # column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+        column_title = "HALLMARK_COMPLEMENT",
+        # top_annotation = columnAnnotation(Group = anno_block(labels = c("D0","","D1","","D2","","D4","","D7",""),
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("D1","D1","D2","D2","D4","D4","D7","D7"),
+                                                             gp = gpar(col = NA,fill = NA),labels_just = "left"),
+                                          Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),4),
+                                          # Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),5),
+                                                                 gp=gpar(col = NA) ))
+        )
+```
+
+
+
+```{r fig.height=16, fig.width=11}
+Heatmap(normalizeCountsForHeatmapByIndividual(assay(assays(analysis$dds)$rld),
+                                  analysis$dds@colData,
+                                  group_var = 'timepoint',
+                                  baseline = 'D0',
+                                  individual_var = 'individual')[filter(joint_GSEA_curated_results,source == 'HALLMARK',ID=='D1_AS03.v.No_adjuvant',pathway == "HALLMARK_E2F_TARGETS") %>% pull(leadingEdge) %>% unlist(), c(11:49), drop = FALSE],
+                      # pull(gene_id), , drop = FALSE],
+        name = "log2FoldDiff\nfrom med D0",
+        col = circlize::colorRamp2(c(-1,0,1),c("blue","white","red")),
+        # column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}"),
+        column_labels = str_extract(colnames(analysis$dds),"[RL][:alpha:]{1,2}[:digit:]{2}")[c(11:49)],
+        cluster_columns = FALSE,
+        cluster_rows = FALSE,
+        column_split = interaction(analysis$dds$Group,analysis$dds$timepoint)[c(11:49)],
+        # column_split = interaction(analysis$dds$Group,analysis$dds$timepoint),
+        column_title = "HALLMARK_E2F_TARGETS",
+        # top_annotation = columnAnnotation(Group = anno_block(labels = c("D0","","D1","","D2","","D4","","D7",""),
+        top_annotation = columnAnnotation(Group = anno_block(labels = c("D1","D1","D2","D2","D4","D4","D7","D7"),
+                                                             gp = gpar(col = NA,fill = NA),labels_just = "left"),
+                                          Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),4),
+                                          # Timepoint = anno_block(labels = rep(c("No_adjuvant","AS03"),5),
+                                                                 gp=gpar(col = NA) ))
+        )
+```
+
+
+
+```{r}
+joint_allGroup_gsea_results <- combine_GSEA_results(gsea_all_results)
+```
+```{r fig.height=13, fig.width=8}
+gseaDotplot_joint(joint_allGroup_gsea_results %>% filter(source == 'HALLMARK'))
+```
+
+
+```{r, fig.height=10}
+gsea_plots[['AS03_D1']] <- gseaDotplot_single(gsea_results$AS03_D7, signif_only = FALSE, filter_source = 'HALLMARK')
+```
+
+```{r, fig.height=10}
+gsea_plots[['No_adjuvant_D7']] <- gseaDotplot_single(gsea_results$No_adjuvant_D1, signif_only = FALSE, filter_source = 'HALLMARK')
+```
+
+### joint
+
+```{r}
+## joint GSEA
+combine_GSEA_results <- function(gsea_results,
+                                 pathways,
+                                 sources){
+  if (!missing(pathways)) {
+    gsea_results <- lapply(gsea_results, function(x){x %>% filter(pathway %in% pathways)})
+  }
+  if (!missing(sources)) {
+    gsea_results <- lapply(gsea_results, function(x){x %>% filter(source %in% sources)}) 
+  }
+  gsea_results <- data.table::rbindlist(gsea_results, idcol='ID')
+}
+
+# pathways = c('REACTOME_SIGNALING_BY_GPCR', 'REACTOME_SIGNALING_BY_NTRKS')
+joint_GSEA_results <- combine_GSEA_results(gsea_results)
+```
+
+
+```{r, fig.width=10, fig.height=14}
+pathways <- head(joint_GSEA_results %>% 
+                   dplyr::group_by(pathway) %>% 
+                   dplyr::summarize(x = median(pval)) %>% 
+                   arrange(x), 25)$pathway
+gsea_plots[['joint all plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                      filter(source == 'HALLMARK'),
+                                                    x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5))
+gsea_plots[['joint all plot']] 
+```
+
+### Requested
+
+#### D1 AS03 + D4 & D7 No_adjuvant
+
+```{r}
+pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+      (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+pathways <- intersect(pathways,
+      (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant table']] <- joint_GSEA_results %>%
+  select(ID, pathway, source, pval,padj,NES,size) %>%
+  arrange(pathway) %>%
+  DT::datatable(
+    rownames = FALSE,
+    filter='top',
+    autoHideNavigation = TRUE,
+    extensions = c('Buttons', 'Scroller'),
+    options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv'),
+      pageLength = 15,
+      deferRender = TRUE
+    ),
+    caption='Shared significantly enriched pathways from AS03 D1 and No_adjuvant D4/D7') %>%
+  formatRound(c('pval','padj','NES'), digits=3)
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant hallmark plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='HALLMARK'),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5))
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant hallmark plot']]
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+pathways <- sample(unique((joint_GSEA_results %>%
+            filter(source=='REACTOME'))$pathway), size = 25)
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant reactome plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='REACTOME') %>%
+                                                                     filter(pathway %in% pathways),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5)) +
+  labs(caption='Random selection of 25 reactome pathways that based significance criteria')
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant reactome plot']]
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+pathways <- sample(unique((joint_GSEA_results %>%
+            filter(source=='KEGG'))$pathway), size = 25)
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant kegg plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='KEGG') %>%
+                                                                     filter(pathway %in% pathways),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5)) +
+  labs(caption='Random selection of 25 kegg pathways that based significance criteria')
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant kegg plot']]
+```
+
+
+#### D1 AS03 + D1 No_adjuvant
+
+```{r}
+pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+      (gsea_results$No_adjuvant_D1 %>% filter(pval < 0.05))$pathway)
+joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+
+gsea_plots[['D1 AS03 + D1 No_adjuvant table']] <- joint_GSEA_results %>%
+  select(ID, pathway, source, pval,padj,NES,size) %>%
+  arrange(pathway) %>%
+  DT::datatable(
+    rownames = FALSE,
+    filter='top',
+    autoHideNavigation = TRUE,
+    extensions = c('Buttons', 'Scroller'),
+    options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv'),
+      pageLength = 15,
+      deferRender = TRUE
+    ),
+    caption='Shared significantly enriched pathways from AS03 D1 and No_adjuvant D1') %>%
+  formatRound(c('pval','padj','NES'), digits=3)
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+gsea_plots[['D1 AS03 + D1 No_adjuvant hallmark plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='HALLMARK'),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5))
+gsea_plots[['D1 AS03 + D1 No_adjuvant hallmark plot']]
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+pathways <- sample(unique((joint_GSEA_results %>%
+            filter(source=='REACTOME'))$pathway), size = 25)
+gsea_plots[['D1 AS03 + D1 No_adjuvant reactome plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='REACTOME') %>%
+                                                                     filter(pathway %in% pathways),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5)) +
+  labs(caption='Random selection of 25 reactome pathways that based significance criteria')
+gsea_plots[['D1 AS03 + D1 No_adjuvant reactome plot']]
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+# pathways <- sample(unique((joint_GSEA_results %>%
+#             filter(source=='KEGG'))$pathway), size = 25)
+pathways <- unique((joint_GSEA_results %>%
+            filter(source=='KEGG'))$pathway)
+gsea_plots[['D1 AS03 + D1 No_adjuvant kegg plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='KEGG') %>%
+                                                                     filter(pathway %in% pathways),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5)) +
+  labs(caption='Random selection of 25 kegg pathways that based significance criteria')
+gsea_plots[['D1 AS03 + D1 No_adjuvant kegg plot']]
+```
+
+
+
+# Writing results
+
+```{r}
+writeDESeqResults(model_results)
+```
+
+```{r}
+writefGSEAResults(gsea_results)
+```
+
+# Render outfile
+
+```{r}
+rmarkdown::render(here::here('analysis_scripts/bulk_rnaseq_draft_figures_additional.format.Rmd'),
+                  output_file = 'Draft_Figures_Additional_CIVIC-M1_p21257_Tiffany_v2.html',
+                  output_dir = here::here('reports'),
+                  params = list(
+                    title = 'CIVIC-M1 (p21257) Bulk RNA Draft Figures Additional')
+                  )
+```
+
